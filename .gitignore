@@ -1,58 +1,61 @@
-# ===== Build output =====
-build/
+# Compiled class files
+*.class
 
-# ===== IDE files =====
-.idea/
-*.iml
-*.iws
-*.ipr
-.vscode/
-.settings/
-.project
-.classpath
-.factorypath
-*.swp
-*.swo
-*~
+# Log files
+*.log
 
-# ===== Gradle =====
+# Package files
+*.jar
+*.war
+*.ear
+*.zip
+*.tar.gz
+*.rar
+
+# Gradle
 .gradle/
+build/
 !gradle/wrapper/gradle-wrapper.jar
 
-# ===== OS files =====
+# Maven (if applicable)
+target/
+
+# IDE - IntelliJ
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# IDE - Eclipse
+.project
+.classpath
+.settings/
+
+# IDE - VS Code
+.vscode/
+
+# IDE - NetBeans
+nbproject/
+nbbuild/
+nbdist/
+nb-configuration.xml
+
+# OS files
 .DS_Store
 Thumbs.db
-ehthumbs.db
-Desktop.ini
 
-# ===== Logs =====
-*.log
-logs/
+# Spring Boot
+*.pid
 
-# ===== Environment / secrets =====
+# bin directory
+bin/
+
+# Environment files
 .env
-.env.*
-!.env.example
-application-local.yml
-application-local.properties
-
-# ===== Docker =====
-docker-compose.override.yml
-
-# ===== Test / coverage =====
-*.exec
-jacoco.exec
-coverage/
-test-output/
-
-# ===== Misc =====
-*.bak
-*.tmp
-*.orig
-hs_err_pid*
-replay_pid*
+*.env.local
 
 
 artifacts/
-
-target/
+.github/
+gradle/
