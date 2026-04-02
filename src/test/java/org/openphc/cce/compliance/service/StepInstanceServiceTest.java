@@ -97,7 +97,6 @@ class StepInstanceServiceTest {
             StepInstance step = buildStep(StepState.PENDING, dueDate, dueDate.plusDays(3));
 
             when(stepInstanceRepository.save(any())).thenAnswer(i -> i.getArgument(0));
-            when(stepInstanceRepository.findByProtocolInstanceId(any())).thenReturn(List.of(step));
 
             UUID eventId = UUID.randomUUID();
             service.completeStep(step, eventId, "test-source");
@@ -120,7 +119,6 @@ class StepInstanceServiceTest {
             StepInstance step = buildStep(StepState.DUE, pastDue, futureOverdue);
 
             when(stepInstanceRepository.save(any())).thenAnswer(i -> i.getArgument(0));
-            when(stepInstanceRepository.findByProtocolInstanceId(any())).thenReturn(List.of(step));
 
             service.completeStep(step, UUID.randomUUID(), "test-source");
 
@@ -135,7 +133,6 @@ class StepInstanceServiceTest {
             StepInstance step = buildStep(StepState.OVERDUE, pastDue, pastOverdue);
 
             when(stepInstanceRepository.save(any())).thenAnswer(i -> i.getArgument(0));
-            when(stepInstanceRepository.findByProtocolInstanceId(any())).thenReturn(List.of(step));
 
             service.completeStep(step, UUID.randomUUID(), "test-source");
 
@@ -175,7 +172,6 @@ class StepInstanceServiceTest {
                 if (s.getId() == null) s.setId(UUID.randomUUID());
                 return s;
             });
-            when(stepInstanceRepository.findByProtocolInstanceId(any())).thenReturn(List.of(step));
 
             // Mock parser to return action metadata with relatedActions
             var mockPlanDef = mock(org.hl7.fhir.r4.model.PlanDefinition.class);
@@ -224,7 +220,6 @@ class StepInstanceServiceTest {
                 if (s.getId() == null) s.setId(UUID.randomUUID());
                 return s;
             });
-            when(stepInstanceRepository.findByProtocolInstanceId(any())).thenReturn(List.of(step));
 
             var mockPlanDef = mock(org.hl7.fhir.r4.model.PlanDefinition.class);
             when(planDefinitionParser.parse(anyString())).thenReturn(mockPlanDef);
@@ -267,7 +262,6 @@ class StepInstanceServiceTest {
                 if (s.getId() == null) s.setId(UUID.randomUUID());
                 return s;
             });
-            when(stepInstanceRepository.findByProtocolInstanceId(any())).thenReturn(List.of(step));
 
             var mockPlanDef = mock(org.hl7.fhir.r4.model.PlanDefinition.class);
             when(planDefinitionParser.parse(anyString())).thenReturn(mockPlanDef);
@@ -471,8 +465,9 @@ class StepInstanceServiceTest {
                     .build();
 
             when(stepInstanceRepository.save(any())).thenAnswer(i -> i.getArgument(0));
-            when(stepInstanceRepository.findByProtocolInstanceId(protocolInstance.getId()))
-                    .thenReturn(List.of(optionalStep, completedStep));
+            when(stepInstanceRepository.findByProtocolInstanceIdAndRequiredBehaviorAndStateIn(
+                    eq(protocolInstance.getId()), eq("could"), anyCollection()))
+                    .thenReturn(List.of(optionalStep));
 
             var mockPlanDef = mock(org.hl7.fhir.r4.model.PlanDefinition.class);
             when(planDefinitionParser.parse(anyString())).thenReturn(mockPlanDef);
@@ -508,8 +503,10 @@ class StepInstanceServiceTest {
                     .build();
 
             when(stepInstanceRepository.save(any())).thenAnswer(i -> i.getArgument(0));
-            when(stepInstanceRepository.findByProtocolInstanceId(protocolInstance.getId()))
-                    .thenReturn(List.of(mustStep, completedStep));
+            // No "could" steps exist, so query returns empty
+            when(stepInstanceRepository.findByProtocolInstanceIdAndRequiredBehaviorAndStateIn(
+                    eq(protocolInstance.getId()), eq("could"), anyCollection()))
+                    .thenReturn(List.of());
 
             var mockPlanDef = mock(org.hl7.fhir.r4.model.PlanDefinition.class);
             when(planDefinitionParser.parse(anyString())).thenReturn(mockPlanDef);
@@ -545,8 +542,10 @@ class StepInstanceServiceTest {
                     .build();
 
             when(stepInstanceRepository.save(any())).thenAnswer(i -> i.getArgument(0));
-            when(stepInstanceRepository.findByProtocolInstanceId(protocolInstance.getId()))
-                    .thenReturn(List.of(completedOptional, completedStep));
+            // Already-terminal "could" steps are not in ACTIONABLE_STATES, so query returns empty
+            when(stepInstanceRepository.findByProtocolInstanceIdAndRequiredBehaviorAndStateIn(
+                    eq(protocolInstance.getId()), eq("could"), anyCollection()))
+                    .thenReturn(List.of());
 
             var mockPlanDef = mock(org.hl7.fhir.r4.model.PlanDefinition.class);
             when(planDefinitionParser.parse(anyString())).thenReturn(mockPlanDef);
