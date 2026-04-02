@@ -48,15 +48,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - DTOs with entity-to-DTO mapping via `DtoMapper`
 - `GlobalExceptionHandler` with structured error responses
 
+#### Intelligence Rules & Actions
+- 9 additional endpoints across 3 controllers (Action Definitions, Action Runs, Intelligence Summary)
+- `IntelligenceRuleService` evaluates nested PlanDefinition sub-actions on deviation and step completion
+- `IntelligenceTriggerProducer` publishes to `cce.intelligence.triggers` with failure metrics
+- `ActionDefinitionService` and `ActionRunService` for intelligence action lifecycle
+
 #### Domain Model
-- 7 JPA entities with UUID primary keys (except `TriggerIndex` composite PK)
-- 7 enums for type-safe status values
+- 9 JPA entities with UUID primary keys (except `TriggerIndex` composite PK)
+- 11 enums for type-safe status values
 - JSONB column support via Hibernate 6 `@JdbcTypeCode(SqlTypes.JSON)`
 - Flyway schema migrations with `ddl-auto=validate`
 - Fetch-join query for protocol instance details (steps + deviations)
 
 #### Observability
-- Micrometer counters: `cce.events.processed`, `cce.events.matched`, `cce.events.duplicate`, `cce.events.zero_match`
+- Micrometer counters: `cce.events.processed`, `cce.events.matched`, `cce.events.duplicate`, `cce.events.zero_match`, `cce.events.intelligence.published`, `cce.events.intelligence.failed`, `cce.intelligence.rules.fired`, `cce.intelligence.rule.evaluation.errors`
 - Micrometer timers: `cce.step.matching.duration`, `cce.events.processing.duration`
 - Micrometer gauge: `cce.protocol.instances.active`
 - Prometheus endpoint, health probes, structured logging
@@ -70,7 +76,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - JaCoCo code coverage reporting
 
 #### Testing
-- 254 unit tests (MockMvc, mocked services)
+- 258 unit tests (MockMvc, mocked services)
 - 24 integration tests (EmbeddedKafka + H2)
 - Integration test source set with separate configuration
 
@@ -86,5 +92,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 - CQL expression evaluation (out of scope for v1.0.0)
-- Intelligence trigger Kafka publishing (deferred to future phase)
 - `cce.protocol.control` topic (reserved for future use)

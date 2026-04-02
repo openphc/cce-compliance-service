@@ -423,7 +423,7 @@ public class IntelligenceTriggerProducer {
 
 **Kafka Key:** `protocolInstanceId` — ensures all intelligence events for a protocol instance are routed to the same partition, preserving ordering per patient journey.
 
-**Failure handling:** If publishing fails after producer retries (3 attempts with idempotent producer), the exception propagates to the caller. The main transaction is not rolled back — the deviation record is persisted, and the failed publish is logged for manual remediation.
+**Failure handling:** If publishing fails after producer retries (3 attempts with idempotent producer), the exception is logged and the `cce.events.intelligence.failed` counter is incremented. The main transaction is not rolled back — the deviation record is persisted, and the failed publish is logged for manual remediation.
 
 ## 8. Ordering & Delivery Guarantees
 

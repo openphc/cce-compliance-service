@@ -140,16 +140,16 @@ org.openphc.cce.compliance
 ├── ComplianceServiceApplication.java          # @SpringBootApplication entry point
 ├── config/                                    # AppConfig, ObservabilityConfig
 ├── domain/
-│   ├── entity/                                # 7 JPA entities
-│   ├── enums/                                 # 6 value-based enums
-│   └── repository/                            # 7 Spring Data JPA repositories
+│   ├── entity/                                # 9 JPA entities + 1 composite PK class
+│   ├── enums/                                 # 11 value-based enums
+│   └── repository/                            # 9 Spring Data JPA repositories
 ├── fhir/                                      # FHIR parsing, JSONLogic & FHIRPath evaluation
 ├── kafka/
 │   ├── config/                                # Consumer/Producer factories, topic bindings
 │   ├── consumer/                              # InboundEventConsumer, SchedulerTriggerConsumer
 │   ├── model/                                 # CloudEventMessage, IntelligenceTriggerEvent
 │   └── producer/                              # IntelligenceTriggerProducer
-├── service/                                   # 9 business logic services + 3 supporting records
+├── service/                                   # 12 business logic services + 3 supporting records
 └── web/                                       # Controllers, DTOs, DtoMapper, ExceptionHandler
 ```
 
@@ -513,7 +513,11 @@ See [API Reference](api-reference.md) for endpoint details.
 | `cce.events.duplicate` | Counter | Duplicate events detected |
 | `cce.events.zero_match` | Counter | Events with zero trigger matches |
 | `cce.events.intelligence.published` | Counter | Intelligence trigger events published to Kafka |
+| `cce.events.intelligence.failed` | Counter | Intelligence trigger events that failed to publish |
+| `cce.intelligence.rules.fired` | Counter | Intelligence rules that fired (condition met) |
+| `cce.intelligence.rule.evaluation.errors` | Counter | PlanDefinition parse errors during rule evaluation |
 | `cce.step.matching.duration` | Timer | Tier 1 + Tier 2 matching time |
+| `cce.events.processing.duration` | Timer | Overall event processing time |
 | `cce.consumer.inbound.errors` | Counter | Inbound event consumer processing errors |
 | `cce.consumer.scheduler.errors` | Counter | Scheduler trigger consumer processing errors |
 | `cce.protocol.instances.active` | Gauge | Active protocol instances |

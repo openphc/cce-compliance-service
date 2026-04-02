@@ -150,6 +150,6 @@ N/A — initial release.
 
 ## Test Coverage
 
-- **254 unit tests** covering all services, controllers, and mappers
+- **258 unit tests** covering all services, controllers, and mappers
 - **24 integration tests** covering end-to-end workflows with EmbeddedKafka + H2
 - JaCoCo coverage reports via `./gradlew test jacocoTestReport`

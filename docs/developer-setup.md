@@ -194,6 +194,7 @@ Migrations are applied automatically on application startup. To run manually:
 |---|---|---|
 | V1 | Initial schema | `V1__initial_schema.sql` |
 | V2 | Intelligence tables | `V2__intelligence_tables.sql` |
+| V3 | Performance indexes | `V3__performance_indexes.sql` |
 
 ## 6. Docker Build
 
@@ -263,7 +264,7 @@ Stage 2: Runtime (eclipse-temurin:21-jre-alpine)
 ### 8.3 Running Tests
 
 ```bash
-# Unit tests (254 tests)
+# Unit tests (258 tests)
 ./gradlew test
 
 # Integration tests (24 tests — EmbeddedKafka + H2)
