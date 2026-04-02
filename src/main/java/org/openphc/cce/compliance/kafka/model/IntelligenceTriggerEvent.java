@@ -8,7 +8,8 @@ import java.time.OffsetDateTime;
 import java.util.UUID;
 
 /**
- * Published to cce.intelligence.triggers when a compliance deviation is detected.
+ * Published to cce.intelligence.triggers when a compliance deviation is detected
+ * or an intelligence rule condition evaluates to true.
  */
 @Getter
 @Setter
@@ -31,4 +32,8 @@ public class IntelligenceTriggerEvent {
     private String facilityId;
     private OffsetDateTime detectedAt;
     private JsonNode metadata;
+    private String severity;
+    private String target;
+    private String definitionCanonical;
+    private UUID actionDefinitionId;
 }

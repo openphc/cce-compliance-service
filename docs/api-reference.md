@@ -324,7 +324,267 @@ Returns compliance deviations detected by the scheduler for this protocol instan
 
 ---
 
-## 4. Actuator Endpoints
+## 4. Action Definitions
+
+Manage Action Definitions that specify what the Intelligence Service does when an intelligence rule fires.
+
+### 4.1 Register Action Definition
+
+**`POST /v1/action-definitions`** — Register a new action definition.
+
+
+**Request Body:**
+
+```json
+{
+  "actionType": "send-notification",
+  "name": "ANC Visit Overdue Alert",
+  "description": "Alert when ANC visit exceeds tolerance window",
+  "messageTemplate": "Patient {{patientId}} has missed {{actionId}}. Last due: {{dueDate}}. Days overdue: {{daysOverdue}}.",
+  "severity": "medium",
+  "target": "assigned_worker",
+  "routing": {
+    "adaptorId": "smartcare-chw-adaptor",
+    "deliveryMode": "webhook",
+    "endpoint": "https://adaptor.example.org/notifications"
+  },
+  "definitionCanonical": "ActivityDefinition/send-anc-overdue-alert"
+}
+```
+
+**Response:** `201 Created`
+
+```json
+{
+  "id": "ad-550e8400-e29b-41d4-a716-446655440010",
+  "actionType": "send-notification",
+  "name": "ANC Visit Overdue Alert",
+  "description": "Alert when ANC visit exceeds tolerance window",
+  "messageTemplate": "Patient {{patientId}} has missed {{actionId}}. Last due: {{dueDate}}. Days overdue: {{daysOverdue}}.",
+  "severity": "medium",
+  "target": "assigned_worker",
+  "routing": {
+    "adaptorId": "smartcare-chw-adaptor",
+    "deliveryMode": "webhook",
+    "endpoint": "https://adaptor.example.org/notifications"
+  },
+  "definitionCanonical": "ActivityDefinition/send-anc-overdue-alert",
+  "createdAt": "2026-03-15T10:30:00Z",
+  "updatedAt": "2026-03-15T10:30:00Z"
+}
+```
+
+**Error Responses:**
+
+| Status | Condition |
+|---|---|
+| `400 Bad Request` | Missing required fields or invalid action type |
+| `409 Conflict` | An action definition with the same `definitionCanonical` already exists |
+
+---
+
+### 4.2 List Action Definitions
+
+**`GET /v1/action-definitions`** — List all registered action definitions.
+
+
+**Response:** `200 OK` — `List<ActionDefinitionDto>`
+
+---
+
+### 4.3 Get Action Definition by ID
+
+**`GET /v1/action-definitions/{id}`**
+
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `id` | UUID | Action definition ID |
+
+**Response:** `200 OK` — `ActionDefinitionDto`
+
+**Error Responses:**
+
+| Status | Condition |
+|---|---|
+| `404 Not Found` | ID does not exist |
+
+---
+
+### 4.4 Update Action Definition
+
+**`PUT /v1/action-definitions/{id}`** — Update an existing action definition.
+
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `id` | UUID | Action definition ID |
+
+**Request Body:** Same structure as POST (all fields replace the current values).
+
+**Response:** `200 OK` — Updated `ActionDefinitionDto`
+
+**Error Responses:**
+
+| Status | Condition |
+|---|---|
+| `404 Not Found` | ID does not exist |
+| `400 Bad Request` | Missing required fields or invalid action type |
+
+---
+
+## 5. Action Runs
+
+Track execution of intelligence-triggered actions.
+
+### 5.1 List Action Runs
+
+**`GET /v1/action-runs?page={page}&size={size}`** — List action runs with pagination.
+
+
+**Query Parameters:**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `page` | int | 0 | Page number (0-based) |
+| `size` | int | 20 | Page size |
+
+**Response:** `200 OK` — `Page<ActionRunDto>`
+
+---
+
+### 5.2 Get Action Run by ID
+
+**`GET /v1/action-runs/{id}`**
+
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `id` | UUID | Action run ID |
+
+**Response:** `200 OK`
+
+```json
+{
+  "id": "ar-660e8400-e29b-41d4-a716-446655440020",
+  "actionDefinitionId": "ad-550e8400-e29b-41d4-a716-446655440010",
+  "intelligenceEventId": "itrig-550e8400-e29b-41d4-a716-446655440099",
+  "status": "completed",
+  "patientId": "260225-0002-5501",
+  "protocolInstanceId": "660e8400-e29b-41d4-a716-446655440001",
+  "stepInstanceId": "770e8400-e29b-41d4-a716-446655440002",
+  "actionType": "send-notification",
+  "severity": "medium",
+  "target": "assigned_worker",
+  "resolvedMessage": "Patient 260225-0002-5501 has missed viral-load-check. Last due: 2026-03-20T00:00:00Z. Days overdue: 5.",
+  "createdAt": "2026-03-25T00:00:05Z",
+  "completedAt": "2026-03-25T00:00:06Z"
+}
+```
+
+**Error Responses:**
+
+| Status | Condition |
+|---|---|
+| `404 Not Found` | ID does not exist |
+
+---
+
+### 5.3 Get Action Run Status
+
+**`GET /v1/action-runs/{id}/status`** — Get current execution status of an action run.
+
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `id` | UUID | Action run ID |
+
+**Response:** `200 OK`
+
+```json
+{
+  "id": "ar-660e8400-e29b-41d4-a716-446655440020",
+  "status": "completed"
+}
+```
+
+---
+
+### 5.4 Cancel Action Run
+
+**`POST /v1/action-runs/{id}:cancel`** — Cancel an in-progress action run.
+
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `id` | UUID | Action run ID |
+
+**Response:** `200 OK` — Updated `ActionRunDto` with `status: "cancelled"`
+
+**Error Responses:**
+
+| Status | Condition |
+|---|---|
+| `404 Not Found` | ID does not exist |
+| `409 Conflict` | Action run is already in a terminal state (`completed`, `failed`, `cancelled`) |
+
+---
+
+## 6. Intelligence Summary
+
+### 6.1 Get Intelligence Summary
+
+**`GET /v1/intelligence/summary?from={from}&to={to}`** — Intelligence events summary with counts by type and period.
+
+
+**Query Parameters:**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `from` | ISO 8601 datetime | No | Start of period (defaults to 30 days ago) |
+| `to` | ISO 8601 datetime | No | End of period (defaults to now) |
+
+**Response:** `200 OK`
+
+```json
+{
+  "period": {
+    "from": "2026-03-01T00:00:00Z",
+    "to": "2026-03-31T23:59:59Z"
+  },
+  "totalEvents": 42,
+  "byType": {
+    "overdue": 28,
+    "missed": 8,
+    "late_completion": 6
+  },
+  "bySeverity": {
+    "low": 10,
+    "medium": 18,
+    "high": 12,
+    "critical": 2
+  },
+  "byTarget": {
+    "assigned_worker": 25,
+    "supervisor": 12,
+    "facility": 5
+  }
+}
+```
+
+---
+
+## 7. Actuator Endpoints
 
 Health and monitoring endpoints (no authentication required).
 
@@ -340,7 +600,7 @@ Health and monitoring endpoints (no authentication required).
 
 ---
 
-## 5. Error Response Format
+## 8. Error Response Format
 
 All errors follow a consistent structure:
 
@@ -387,7 +647,7 @@ All errors follow a consistent structure:
 
 ---
 
-## 6. DTO Schemas
+## 9. DTO Schemas
 
 ### ProtocolDefinitionDto
 
@@ -468,3 +728,38 @@ All errors follow a consistent structure:
 | `protocolInstanceId` | UUID | Yes | Matched protocol instance |
 | `protocolDefinitionId` | UUID | Yes | Matched protocol definition |
 | `matchedStepInstanceId` | UUID | Yes | Matched step instance |
+
+### ActionDefinitionDto
+
+| Field | Type | Nullable | Description |
+|---|---|---|---|
+| `id` | UUID | No | Unique identifier |
+| `actionType` | String | No | Action type: `send-notification`, `create-task`, `forward-data`, `escalate` |
+| `name` | String | No | Human-readable name |
+| `description` | String | Yes | Description of the action |
+| `messageTemplate` | String | Yes | Template with `{{variable}}` placeholders |
+| `severity` | String | No | Default severity: `low`, `medium`, `high`, `critical` |
+| `target` | String | No | Default target: `patient`, `assigned_worker`, `supervisor`, `facility` |
+| `routing` | Map | Yes | Routing configuration (adaptor, delivery mode, endpoint) |
+| `definitionCanonical` | String | No | FHIR `ActivityDefinition` canonical reference |
+| `createdAt` | OffsetDateTime | No | Record creation |
+| `updatedAt` | OffsetDateTime | No | Last update |
+
+### ActionRunDto
+
+| Field | Type | Nullable | Description |
+|---|---|---|---|
+| `id` | UUID | No | Unique identifier |
+| `actionDefinitionId` | UUID | No | FK to ActionDefinition |
+| `intelligenceEventId` | UUID | No | ID of the intelligence trigger event |
+| `status` | String | No | `pending`, `in_progress`, `completed`, `failed`, `cancelled` |
+| `patientId` | String | No | Patient identifier |
+| `protocolInstanceId` | UUID | No | Associated protocol instance |
+| `stepInstanceId` | UUID | Yes | Associated step instance |
+| `actionType` | String | No | Action type executed |
+| `severity` | String | No | Effective severity |
+| `target` | String | No | Effective target |
+| `resolvedMessage` | String | Yes | Message with placeholders resolved |
+| `createdAt` | OffsetDateTime | No | Record creation |
+| `completedAt` | OffsetDateTime | Yes | Completion timestamp |
+| `failureReason` | String | Yes | Reason for failure (if status is `failed`) |

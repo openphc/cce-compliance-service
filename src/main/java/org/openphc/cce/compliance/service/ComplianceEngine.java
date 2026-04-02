@@ -44,6 +44,7 @@ public class ComplianceEngine {
     private final ProtocolInstanceService protocolInstanceService;
     private final StepInstanceService stepInstanceService;
     private final PlanDefinitionParser planDefinitionParser;
+    private final IntelligenceRuleService intelligenceRuleService;
     private final AuditService auditService;
 
     private final Counter eventsProcessedCounter;
@@ -61,6 +62,7 @@ public class ComplianceEngine {
                             ProtocolInstanceService protocolInstanceService,
                             StepInstanceService stepInstanceService,
                             PlanDefinitionParser planDefinitionParser,
+                            IntelligenceRuleService intelligenceRuleService,
                             AuditService auditService,
                             MeterRegistry meterRegistry) {
         this.eventLogService = eventLogService;
@@ -71,6 +73,7 @@ public class ComplianceEngine {
         this.protocolInstanceService = protocolInstanceService;
         this.stepInstanceService = stepInstanceService;
         this.planDefinitionParser = planDefinitionParser;
+        this.intelligenceRuleService = intelligenceRuleService;
         this.auditService = auditService;
 
         this.eventsProcessedCounter = meterRegistry.counter("cce.events.processed");
@@ -161,6 +164,9 @@ public class ComplianceEngine {
         }
 
         stepInstanceService.completeStep(step, eventLog.getId(), event.getSource());
+
+        // Evaluate intelligence rules on step completion
+        intelligenceRuleService.evaluateOnCompletion(step, protocolInstance);
 
         eventLogService.updateStatus(eventLog, ProcessingStatus.MATCHED);
         eventsMatchedCounter.increment();
@@ -258,6 +264,9 @@ public class ComplianceEngine {
 
         // Complete the step
         stepInstanceService.completeStep(step, eventLog.getId(), event.getSource());
+
+        // Evaluate intelligence rules on step completion
+        intelligenceRuleService.evaluateOnCompletion(step, protocolInstance);
 
         auditService.audit("COMPLIANCE", "EVENT_MATCHED", "system",
                 "EventLog", eventLog.getId().toString(),

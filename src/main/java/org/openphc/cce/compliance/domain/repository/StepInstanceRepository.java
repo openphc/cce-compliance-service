@@ -18,4 +18,7 @@ public interface StepInstanceRepository extends JpaRepository<StepInstance, UUID
 
     List<StepInstance> findByProtocolInstanceIdAndActionIdAndStateIn(
             UUID protocolInstanceId, String actionId, Collection<StepState> states);
+
+    List<StepInstance> findByProtocolInstanceIdAndRequiredBehaviorAndStateIn(
+            UUID protocolInstanceId, String requiredBehavior, Collection<StepState> states);
 }

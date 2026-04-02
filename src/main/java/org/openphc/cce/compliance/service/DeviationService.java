@@ -24,13 +24,16 @@ public class DeviationService {
     private static final Logger log = LoggerFactory.getLogger(DeviationService.class);
 
     private final DeviationRepository deviationRepository;
+    private final IntelligenceRuleService intelligenceRuleService;
     private final AuditService auditService;
     private final ObjectMapper objectMapper;
 
     public DeviationService(DeviationRepository deviationRepository,
+                            IntelligenceRuleService intelligenceRuleService,
                             AuditService auditService,
                             ObjectMapper objectMapper) {
         this.deviationRepository = deviationRepository;
+        this.intelligenceRuleService = intelligenceRuleService;
         this.auditService = auditService;
         this.objectMapper = objectMapper;
     }
@@ -41,9 +44,9 @@ public class DeviationService {
     }
 
     /**
-     * Record a deviation and persist it.
-     * Intelligence trigger publishing is not performed here — it will be driven
-     * by PlanDefinition-level configuration in a future phase.
+     * Record a deviation, persist it, and evaluate intelligence rules.
+     * Intelligence rules are nested sub-actions within the PlanDefinition step,
+     * evaluated against the step's runtime state.
      *
      * @return the persisted Deviation entity
      */
@@ -72,6 +75,9 @@ public class DeviationService {
 
         log.info("Recorded {} deviation: deviationId={}, stepId={}, protocolInstanceId={}",
                 deviationType, deviation.getId(), step.getId(), protocolInstance.getId());
+
+        // Evaluate intelligence rules for this deviation
+        intelligenceRuleService.evaluateOnDeviation(step, deviation, protocolInstance);
 
         return deviation;
     }

@@ -21,8 +21,8 @@ spring:
     properties:
       hibernate:
         jdbc:
-          batch_size: 25
-          fetch_size: 50
+          batch_size: 50
+          fetch_size: 100
         order_inserts: true
         order_updates: true
         generate_statistics: false
@@ -44,9 +44,10 @@ spring:
         fetch.max.wait.ms: 500
     producer:
       properties:
-        batch.size: 32768
-        linger.ms: 10
+        batch.size: 65536
+        linger.ms: 20
         buffer.memory: 67108864
+        compression.type: snappy
 
 # --- Custom Kafka Topics (production partitioning) ---
 cce:

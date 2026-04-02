@@ -99,6 +99,10 @@ sequenceDiagram
                     StepInst->>DB: INSERT INTO step_instance(s) (state=PENDING)
                 end
 
+                Note over Engine,Audit: Intelligence Rule Evaluation (on completion)
+                Engine->>Engine: evaluateIntelligenceRules(step, completion context)
+                Note over Engine: If step has nested sub-actions with<br/>conditions, evaluate against completion context<br/>(e.g., late completion alerts)
+
                 Engine->>EventLog: updateMatchResult(MATCHED)
                 Engine->>Audit: auditSystem("event.processing", "matched", ...)
             else No Matches
@@ -258,9 +262,9 @@ flowchart TD
     W --> X["Update Event Log<br/>matchedStepInstanceId"]
 ```
 
-## 5. Deviation Detection & Recording
+## 5. Deviation Detection & Intelligence Rule Evaluation
 
-> **Note:** Intelligence trigger publishing upon deviation is reserved for a future phase (will be driven by PlanDefinition-level configuration).
+When a step transitions to `OVERDUE` or `MISSED`, the system records a deviation and evaluates intelligence rules defined on that step in the PlanDefinition.
 
 ```mermaid
 flowchart TD
@@ -279,10 +283,76 @@ flowchart TD
     D3 --> D4["Build metadata:<br/>daysOverdue/daysPastMissedDate"]
     D4 --> D5["Link to ProtocolInstance + StepInstance"]
     D5 --> D6["Persist to DB"]
-    D6 --> D7["Audit: DEVIATION_DETECTED"]
+    D6 --> INTEL["Evaluate Intelligence Rules"]
+
+    INTEL --> IR1{"Step has nested<br/>intelligence sub-actions?"}
+    IR1 -->|"No"| D7["Audit: DEVIATION_DETECTED"]
+    IR1 -->|"Yes"| IR2["Build evaluation context:<br/>stepState, daysOverdue, patient, protocol"]
+
+    IR2 --> IR3["For each intelligence rule"]
+    IR3 --> IR4{"Evaluate condition<br/>(JSONLogic/FHIRPath)"}
+    IR4 -->|"false"| IR3
+    IR4 -->|"true"| IR5["Resolve definitionCanonical<br/>→ ActionDefinition"]
+    IR5 --> IR6["Build IntelligenceTriggerEvent"]
+    IR6 --> IR7["Publish to cce.intelligence.triggers"]
+    IR7 --> IR8["Create ActionRun record"]
+    IR8 --> IR9["Set intelligence_event_id<br/>on Deviation"]
+    IR9 --> D7
+
+    D7 --> DONE["Done"]
 ```
 
-## 7. REST API Request Flow
+## 6. Intelligence Rule Evaluation — Detailed Sequence
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant StepSvc as StepInstanceService
+    participant DevSvc as DeviationService
+    participant IntelSvc as IntelligenceRuleService
+    participant Parser as PlanDefinitionParser
+    participant ExprEval as ExpressionEvaluationService
+    participant Producer as IntelligenceTriggerProducer
+    participant ActionSvc as ActionDefinitionService
+    participant DB as PostgreSQL
+    participant Kafka as Apache Kafka
+
+    StepSvc->>DevSvc: recordDeviation(step, type)
+    DevSvc->>DB: INSERT INTO deviation
+    DB-->>DevSvc: Deviation entity
+
+    DevSvc->>IntelSvc: evaluateIntelligenceRules(step, deviation, protocol)
+
+    IntelSvc->>Parser: getIntelligenceSubActions(actionDefinition)
+    Parser-->>IntelSvc: List<Action> (nested sub-actions)
+
+    loop For each intelligence sub-action
+        IntelSvc->>IntelSvc: Build evaluation context<br/>(stepState, daysOverdue, patient, protocol)
+        IntelSvc->>ExprEval: evaluate(condition, context)
+        ExprEval-->>IntelSvc: boolean result
+
+        alt Condition is true
+            IntelSvc->>IntelSvc: Extract severity & target from extensions
+            IntelSvc->>ActionSvc: resolveByCanonical(definitionCanonical)
+            ActionSvc->>DB: SELECT FROM action_definition WHERE definition_canonical = ?
+            DB-->>ActionSvc: ActionDefinition
+            ActionSvc-->>IntelSvc: ActionDefinition (or null)
+
+            IntelSvc->>IntelSvc: Build IntelligenceTriggerEvent
+            IntelSvc->>Producer: publish(event)
+            Producer->>Kafka: Send to cce.intelligence.triggers<br/>(key = protocolInstanceId)
+            Kafka-->>Producer: ack
+
+            IntelSvc->>DB: INSERT INTO action_run (status=pending)
+            IntelSvc->>DB: UPDATE deviation SET intelligence_event_id = ?
+        end
+    end
+
+    IntelSvc-->>DevSvc: intelligence evaluation complete
+    DevSvc->>DB: Audit: DEVIATION_DETECTED + INTELLIGENCE_PUBLISHED
+```
+
+## 8. REST API Request Flow
 
 ```mermaid
 sequenceDiagram
@@ -336,7 +406,7 @@ sequenceDiagram
     end
 ```
 
-## 8. Kafka Consumer Error Handling
+## 9. Kafka Consumer Error Handling
 
 ```mermaid
 flowchart TD

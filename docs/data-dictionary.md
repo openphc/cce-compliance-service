@@ -17,9 +17,11 @@
 7. [trigger_index](#7-trigger_index)
 8. [event_log](#8-event_log)
 9. [audit_log](#9-audit_log)
-10. [Enumerated Value Reference](#10-enumerated-value-reference)
-11. [Relationships & Foreign Keys](#11-relationships--foreign-keys)
-12. [JSONB Column Schemas](#12-jsonb-column-schemas)
+10. [action_definition](#10-action_definition)
+11. [action_run](#11-action_run)
+12. [Enumerated Value Reference](#12-enumerated-value-reference)
+13. [Relationships & Foreign Keys](#13-relationships--foreign-keys)
+14. [JSONB Column Schemas](#14-jsonb-column-schemas)
 
 ---
 
@@ -32,6 +34,8 @@ erDiagram
     PROTOCOL_INSTANCE ||--o{ STEP_INSTANCE : "contains"
     PROTOCOL_INSTANCE ||--o{ DEVIATION : "has"
     STEP_INSTANCE ||--o{ DEVIATION : "causes"
+    DEVIATION ||--o| ACTION_RUN : "triggers"
+    ACTION_DEFINITION ||--o{ ACTION_RUN : "executed as"
 
     PROTOCOL_DEFINITION {
         uuid id PK
@@ -120,6 +124,37 @@ erDiagram
         varchar ip_address
         timestamptz timestamp
     }
+
+    ACTION_DEFINITION {
+        uuid id PK
+        varchar action_type
+        varchar name
+        varchar description
+        varchar message_template
+        varchar severity
+        varchar target
+        jsonb routing
+        varchar definition_canonical
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    ACTION_RUN {
+        uuid id PK
+        uuid action_definition_id FK
+        uuid intelligence_event_id
+        varchar status
+        varchar patient_id
+        uuid protocol_instance_id FK
+        uuid step_instance_id FK
+        varchar action_type
+        varchar severity
+        varchar target
+        text resolved_message
+        varchar failure_reason
+        timestamptz created_at
+        timestamptz completed_at
+    }
 ```
 
 ---
@@ -134,8 +169,8 @@ erDiagram
 | 4 | `deviation` | Compliance deviations (overdue, missed) | Medium |
 | 5 | `trigger_index` | Inverted index for fast Tier 1 structural event matching | Low (rebuilt on protocol load) |
 | 6 | `event_log` | Immutable log of all inbound CloudEvents and their processing outcomes | High (every event) |
-| 7 | `audit_log` | System and user audit trail | Medium–High |
-
+| 7 | `audit_log` | System and user audit trail | Medium–High || 9 | `action_definition` | Intelligence action definitions (`ActivityDefinition` resources) | Low (tens) |
+| 10 | `action_run` | Intelligence action execution records | Medium–High |
 ---
 
 ## 3. protocol_definition
@@ -269,7 +304,7 @@ Tracks an **individual action occurrence** within a patient's protocol journey. 
 
 ## 6. deviation
 
-Records **compliance deviations** detected during protocol execution. Created when a step transitions to `OVERDUE` or `MISSED`. Intelligence trigger publishing upon deviation is reserved for a future phase (will be driven by PlanDefinition-level configuration).
+Records **compliance deviations** detected during protocol execution. Created when a step transitions to `OVERDUE` or `MISSED`. Intelligence trigger events are published to Kafka upon deviation detection, and intelligence rules on the step are evaluated to produce additional intelligence events.
 
 ### Columns
 
@@ -280,7 +315,7 @@ Records **compliance deviations** detected during protocol execution. Created wh
 | `step_instance_id` | `UUID` | **NOT NULL** | — | Foreign key → `step_instance.id`. |
 | `deviation_type` | `VARCHAR` | **NOT NULL** | — | Type classification. See [DeviationType](#deviationtype). |
 | `detected_at` | `TIMESTAMPTZ` | **NOT NULL** | `now()` | Detection timestamp. |
-| `intelligence_event_id` | `UUID` | Yes | — | Reserved for future phase: links to the intelligence event published to Kafka when PlanDefinition-driven intelligence triggers are enabled. `NULL` in release 1.0.0. |
+| `intelligence_event_id` | `UUID` | Yes | — | Links to the intelligence trigger event published to Kafka when the deviation was detected. Populated after successful Kafka publish. `NULL` if the intelligence rule did not fire or publish failed. |
 | `metadata` | `JSONB` | Yes | — | Deviation-type-specific timing details. See [JSONB: deviation metadata](#deviation--metadata). |
 
 ### Constraints & Indexes
@@ -426,7 +461,78 @@ The `:codeTriples` parameter is a list of `path|system|code` strings extracted f
 
 ---
 
-## 10. Enumerated Value Reference
+## 10. action_definition
+
+Stores **Action Definitions** that specify what the Intelligence Service does when an intelligence rule fires. Each row represents an `ActivityDefinition` resource referenced by intelligence rules in PlanDefinition via `definitionCanonical`.
+
+### Columns
+
+| Column | Data Type | Nullable | Default | Description |
+|--------|-----------|----------|---------|-------------|
+| `id` | `UUID` | **NOT NULL** | `gen_random_uuid()` | Primary key. |
+| `action_type` | `VARCHAR` | **NOT NULL** | — | Type of action: `send-notification`, `create-task`, `forward-data`, `escalate`. See [ActionType](#actiontype). |
+| `name` | `VARCHAR` | **NOT NULL** | — | Human-readable name (e.g., "ANC Visit Overdue Alert"). |
+| `description` | `VARCHAR` | Yes | — | Description of what this action does. |
+| `message_template` | `TEXT` | Yes | — | Message template with `{{variable}}` placeholders (e.g., `"Patient {{patientId}} missed {{actionId}}"`). |
+| `severity` | `VARCHAR` | **NOT NULL** | — | Default severity level. See [IntelligenceSeverity](#intelligenceseverity). |
+| `target` | `VARCHAR` | **NOT NULL** | — | Default target recipient. See [IntelligenceTarget](#intelligencetarget). |
+| `routing` | `JSONB` | Yes | — | Routing configuration for intelligence event delivery. See [JSONB: routing](#action_definition--routing). |
+| `definition_canonical` | `VARCHAR` | **NOT NULL** | — | FHIR `ActivityDefinition` canonical reference (e.g., `ActivityDefinition/send-supervisor-escalation`). Referenced by PlanDefinition intelligence rules. |
+| `created_at` | `TIMESTAMPTZ` | **NOT NULL** | `now()` | Record creation timestamp. |
+| `updated_at` | `TIMESTAMPTZ` | **NOT NULL** | `now()` | Last modification timestamp. |
+
+### Constraints & Indexes
+
+| Type | Name | Details |
+|------|------|---------|
+| Primary Key | `action_definition_pkey` | `id` |
+| Unique | `action_definition_definition_canonical_key` | `definition_canonical` — Ensures one action definition per canonical reference. |
+| Check | — | `action_type IN ('send-notification', 'create-task', 'forward-data', 'escalate')` |
+| Check | — | `severity IN ('low', 'medium', 'high', 'critical')` |
+| Check | — | `target IN ('patient', 'assigned_worker', 'supervisor', 'facility')` |
+| B-tree Index | `idx_action_definition_type` | `action_type` |
+
+---
+
+## 11. action_run
+
+Tracks the **execution** of intelligence-triggered actions. Created when an intelligence rule fires and an `IntelligenceTriggerEvent` is published. Records the resolved message, delivery status, and failure reason if applicable.
+
+### Columns
+
+| Column | Data Type | Nullable | Default | Description |
+|--------|-----------|----------|---------|-------------|
+| `id` | `UUID` | **NOT NULL** | `gen_random_uuid()` | Primary key. |
+| `action_definition_id` | `UUID` | **NOT NULL** | — | Foreign key → `action_definition.id`. |
+| `intelligence_event_id` | `UUID` | **NOT NULL** | — | ID of the `IntelligenceTriggerEvent` published to Kafka. |
+| `status` | `VARCHAR` | **NOT NULL** | — | Execution status. See [ActionRunStatus](#actionrunstatus). |
+| `patient_id` | `VARCHAR` | **NOT NULL** | — | Patient identifier. |
+| `protocol_instance_id` | `UUID` | Yes | — | Foreign key → `protocol_instance.id`. |
+| `step_instance_id` | `UUID` | Yes | — | Foreign key → `step_instance.id`. |
+| `action_type` | `VARCHAR` | **NOT NULL** | — | Action type executed (denormalized from `action_definition`). |
+| `severity` | `VARCHAR` | **NOT NULL** | — | Effective severity (may be overridden by intelligence rule extension). |
+| `target` | `VARCHAR` | **NOT NULL** | — | Effective target (may be overridden by intelligence rule extension). |
+| `resolved_message` | `TEXT` | Yes | — | Message with `{{variable}}` placeholders resolved against runtime context. |
+| `failure_reason` | `VARCHAR` | Yes | — | Reason for failure (populated when `status = 'failed'`). |
+| `created_at` | `TIMESTAMPTZ` | **NOT NULL** | `now()` | Record creation timestamp. |
+| `completed_at` | `TIMESTAMPTZ` | Yes | — | Completion timestamp. `NULL` for non-terminal runs. |
+
+### Constraints & Indexes
+
+| Type | Name | Details |
+|------|------|---------|
+| Primary Key | `action_run_pkey` | `id` |
+| Foreign Key | `action_run_action_definition_id_fkey` | `action_definition_id` → `action_definition(id)` |
+| Foreign Key | `action_run_protocol_instance_id_fkey` | `protocol_instance_id` → `protocol_instance(id)` |
+| Foreign Key | `action_run_step_instance_id_fkey` | `step_instance_id` → `step_instance(id)` |
+| Check | — | `status IN ('pending', 'in_progress', 'completed', 'failed', 'cancelled')` |
+| B-tree Index | `idx_action_run_status` | `status` |
+| B-tree Index | `idx_action_run_patient` | `patient_id` |
+| B-tree Index | `idx_action_run_protocol` | `protocol_instance_id` |
+
+---
+
+## 12. Enumerated Value Reference
 
 ### ProtocolDefinitionStatus
 
@@ -487,9 +593,46 @@ The `:codeTriples` parameter is a list of `path|system|code` strings extracted f
 | `PROCESSING` | Failure during the matching pipeline. |
 | `VALIDATION` | Failure during input validation. |
 
+### ActionType
+
+| Value | Description |
+|-------|-------------|
+| `send-notification` | Send a notification to a target (patient, worker, supervisor). |
+| `create-task` | Create a task in a destination system via Receiver Adaptor. |
+| `forward-data` | Forward event data to a destination system. |
+| `escalate` | Escalate to a supervisor or higher authority. |
+
+### IntelligenceSeverity
+
+| Value | Description |
+|-------|-------------|
+| `low` | Informational. No immediate action required. |
+| `medium` | Moderate concern. Action recommended within normal workflow. |
+| `high` | Significant concern. Prompt action required. |
+| `critical` | Urgent. Immediate action required. |
+
+### IntelligenceTarget
+
+| Value | Description |
+|-------|-------------|
+| `patient` | Notification directed to the patient (via patient-facing app). |
+| `assigned_worker` | Notification directed to the assigned CHW or healthcare worker. |
+| `supervisor` | Escalation to the supervisor or program manager. |
+| `facility` | Notification to the facility (facility-level dashboard or EMR). |
+
+### ActionRunStatus
+
+| Value | Description |
+|-------|-------------|
+| `pending` | Action run created, awaiting execution by Intelligence Service. |
+| `in_progress` | Intelligence Service is executing the action. |
+| `completed` | Action successfully executed. |
+| `failed` | Action execution failed (see `failure_reason`). |
+| `cancelled` | Action run cancelled before completion. |
+
 ---
 
-## 11. Relationships & Foreign Keys
+## 13. Relationships & Foreign Keys
 
 | Parent Table | Child Table | FK Column | Cascade | Description |
 |-------------|-------------|-----------|---------|-------------|
@@ -498,12 +641,15 @@ The `:codeTriples` parameter is a list of `path|system|code` strings extracted f
 | `protocol_instance` | `step_instance` | `protocol_instance_id` | JPA `CascadeType.ALL` | Steps fully managed by parent. |
 | `protocol_instance` | `deviation` | `protocol_instance_id` | JPA `CascadeType.ALL` | Deviations fully managed by parent. |
 | `step_instance` | `deviation` | `step_instance_id` | No cascade (DB level) | Reference only; not cascade-deleted. |
+| `action_definition` | `action_run` | `action_definition_id` | No cascade | Action runs reference their definition. |
+| `protocol_instance` | `action_run` | `protocol_instance_id` | No cascade | Reference only. |
+| `step_instance` | `action_run` | `step_instance_id` | No cascade | Reference only. |
 
 
 
 ---
 
-## 12. JSONB Column Schemas
+## 14. JSONB Column Schemas
 
 ### protocol_definition — `definition`
 
@@ -604,3 +750,33 @@ Content varies by audit event type:
 |------------|---------|
 | STEP_COMPLETED | `{"protocolInstanceId": "pi-uuid-...", "actionId": "anc-visit-1", "completionStatus": "ON_TIME"}` |
 | PROTOCOL_LOADED | `{"url": "http://openphc.org/.../anc-high-risk", "version": "2.1", "actionCount": 9, "triggerIndexEntries": 24}` |
+| INTELLIGENCE_PUBLISHED | `{"intelligenceEventId": "itrig-uuid-...", "deviationType": "overdue", "severity": "high", "target": "supervisor"}` |
+
+### action_definition — `routing`
+
+Routing configuration for intelligence event delivery to Receiver Adaptors.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `adaptorId` | String | Yes | Identifier of the Receiver Adaptor (e.g., `smartcare-chw-adaptor`) |
+| `deliveryMode` | String | Yes | Delivery mechanism: `webhook` (push) or `topic` (pull via Kafka topic subscription) |
+| `endpoint` | String | Conditional | Webhook URL for push delivery. Required when `deliveryMode = "webhook"`. |
+| `topicName` | String | Conditional | Kafka topic name for pull delivery. Required when `deliveryMode = "topic"`. |
+
+**Examples:**
+
+```json
+{
+  "adaptorId": "smartcare-chw-adaptor",
+  "deliveryMode": "webhook",
+  "endpoint": "https://adaptor.example.org/notifications"
+}
+```
+
+```json
+{
+  "adaptorId": "facility-emr-adaptor",
+  "deliveryMode": "topic",
+  "topicName": "cce.actions.facility-emr"
+}
+```

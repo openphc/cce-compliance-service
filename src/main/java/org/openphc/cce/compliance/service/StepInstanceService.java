@@ -284,13 +284,12 @@ public class StepInstanceService {
      * within the same protocol instance are automatically skipped.
      */
     private void autoSkipPrecedingOptionalSteps(StepInstance completedStep) {
-        List<StepInstance> siblings = stepInstanceRepository
-                .findByProtocolInstanceId(completedStep.getProtocolInstance().getId());
+        List<StepInstance> optionalActionable = stepInstanceRepository
+                .findByProtocolInstanceIdAndRequiredBehaviorAndStateIn(
+                        completedStep.getProtocolInstance().getId(), "could", ACTIONABLE_STATES);
 
-        for (StepInstance sibling : siblings) {
+        for (StepInstance sibling : optionalActionable) {
             if (sibling.getId().equals(completedStep.getId())) continue;
-            if (!"could".equals(sibling.getRequiredBehavior())) continue;
-            if (!ACTIONABLE_STATES.contains(sibling.getState())) continue;
 
             sibling.setState(StepState.SKIPPED);
             stepInstanceRepository.save(sibling);

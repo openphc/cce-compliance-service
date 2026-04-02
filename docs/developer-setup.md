@@ -149,10 +149,11 @@ cce-compliance-service/
 │       │   ├── config/          # Spring configuration
 │       │   ├── domain/          # Entities, enums, repositories
 │       │   ├── fhir/            # FHIR parsing, JSONLogic & FHIRPath expression evaluation
-│       │   ├── kafka/           # Kafka consumers, models, config
+│       │   ├── kafka/           # Kafka consumers, producers, models, config
 │       │   │   ├── config/      # Consumer/Producer factories, topic bindings
 │       │   │   ├── consumer/    # InboundEventConsumer, SchedulerTriggerConsumer
-│       │   │   └── model/       # CloudEventMessage, SchedulerTriggerMessage, IntelligenceTriggerEvent
+│       │   │   ├── model/       # CloudEventMessage, SchedulerTriggerMessage, IntelligenceTriggerEvent
+│       │   │   └── producer/    # IntelligenceTriggerProducer
 │       │   ├── service/         # Business logic (ComplianceEngine + supporting services)
 │       │   └── web/             # REST controllers, DTOs, exception handler
 │       └── resources/
@@ -192,6 +193,7 @@ Migrations are applied automatically on application startup. To run manually:
 | Version | Description | Script |
 |---|---|---|
 | V1 | Initial schema | `V1__initial_schema.sql` |
+| V2 | Intelligence tables | `V2__intelligence_tables.sql` |
 
 ## 6. Docker Build
 

@@ -32,6 +32,9 @@ class DeviationServiceTest {
     private DeviationRepository deviationRepository;
 
     @Mock
+    private IntelligenceRuleService intelligenceRuleService;
+
+    @Mock
     private AuditService auditService;
 
     private DeviationService service;
@@ -41,7 +44,7 @@ class DeviationServiceTest {
     void setUp() {
         objectMapper = new ObjectMapper();
         objectMapper.registerModule(new JavaTimeModule());
-        service = new DeviationService(deviationRepository, auditService, objectMapper);
+        service = new DeviationService(deviationRepository, intelligenceRuleService, auditService, objectMapper);
     }
 
     @Test

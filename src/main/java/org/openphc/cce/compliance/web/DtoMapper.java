@@ -141,4 +141,50 @@ public class DtoMapper {
         }
         return entities.stream().map(this::toDto).toList();
     }
+
+    public ActionDefinitionDto toDto(ActionDefinition entity) {
+        return ActionDefinitionDto.builder()
+                .id(entity.getId())
+                .actionType(entity.getActionType().name())
+                .name(entity.getName())
+                .description(entity.getDescription())
+                .messageTemplate(entity.getMessageTemplate())
+                .severity(entity.getSeverity().name())
+                .target(entity.getTarget().name())
+                .routing(entity.getRouting())
+                .definitionCanonical(entity.getDefinitionCanonical())
+                .createdAt(entity.getCreatedAt())
+                .updatedAt(entity.getUpdatedAt())
+                .build();
+    }
+
+    public List<ActionDefinitionDto> toDtoActionDefinitionList(List<ActionDefinition> entities) {
+        if (entities == null) {
+            return Collections.emptyList();
+        }
+        return entities.stream().map(this::toDto).toList();
+    }
+
+    public ActionRunDto toDto(ActionRun entity) {
+        return ActionRunDto.builder()
+                .id(entity.getId())
+                .actionDefinitionId(entity.getActionDefinition().getId())
+                .intelligenceEventId(entity.getIntelligenceEventId())
+                .status(entity.getStatus().name())
+                .patientId(entity.getPatientId())
+                .protocolInstanceId(entity.getProtocolInstanceId())
+                .stepInstanceId(entity.getStepInstanceId())
+                .actionType(entity.getActionType().name())
+                .severity(entity.getSeverity().name())
+                .target(entity.getTarget().name())
+                .resolvedMessage(entity.getResolvedMessage())
+                .failureReason(entity.getFailureReason())
+                .createdAt(entity.getCreatedAt())
+                .completedAt(entity.getCompletedAt())
+                .build();
+    }
+
+    public Page<ActionRunDto> toDtoActionRunPage(Page<ActionRun> page) {
+        return page.map(this::toDto);
+    }
 }

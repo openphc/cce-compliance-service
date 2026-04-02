@@ -2,7 +2,7 @@
 
 ## 1. System Context
 
-The **CCE Compliance Service** is a core microservice within the **Clinical Compliance Engine (CCE)** platform. It tracks patient adherence to clinical protocols defined as FHIR R4 `PlanDefinition` resources — consuming clinical events, matching them against protocol steps, and detecting deviations. Intelligence trigger publishing to downstream analytics is reserved for a future phase (will be driven by PlanDefinition-level configuration).
+The **CCE Compliance Service** is a core microservice within the **Clinical Compliance Engine (CCE)** platform. It tracks patient adherence to clinical protocols defined as FHIR R4 `PlanDefinition` resources — consuming clinical events, matching them against protocol steps, detecting deviations, and generating intelligence events. Intelligence rules are modeled as nested sub-actions within PlanDefinition steps, evaluated against step runtime state, and published to Kafka for downstream consumption by the CCE Intelligence Service.
 
 ```mermaid
 graph TB
@@ -18,6 +18,7 @@ graph TB
         ENGINE["Compliance Engine<br/>(Core Orchestrator)"]
         KAFKA_C["Kafka Consumers"]
         KAFKA_P["Kafka Producers"]
+        INTEL_EVAL["Intelligence Rule<br/>Evaluator"]
         FHIR["FHIR Parser<br/>(FHIR R4 Libraries)"]
         EXPR["Expression Evaluator<br/>(JSONLogic + FHIRPath)"]
         DB[("PostgreSQL 16<br/>+ JSONB")]
@@ -35,6 +36,8 @@ graph TB
     ENGINE --> FHIR
     ENGINE --> EXPR
     ENGINE --> DB
+    ENGINE --> INTEL_EVAL
+    INTEL_EVAL --> EXPR
     ENGINE --> KAFKA_P
     KAFKA_P -->|"cce.intelligence.triggers"| INTEL
     API --> ENGINE
@@ -46,13 +49,13 @@ graph TB
     classDef data fill:#27AE60,stroke:#1E8449,color:white
     classDef broker fill:#E67E22,stroke:#D35400,color:white
 
-    class API,ENGINE,KAFKA_C,KAFKA_P,FHIR,EXPR service
+    class API,ENGINE,KAFKA_C,KAFKA_P,FHIR,EXPR,INTEL_EVAL service
     class EHR,SCHEDULER,INTEL,GATEWAY external
     class DB data
     class KAFKA broker
 ```
 
-**This service does NOT handle:** event collection/ingestion (CCE Collector Service), scheduling (CCE Scheduler Service), analytics, alerting (CCE Intelligence Service), or authentication/authorization (handled by the API Gateway).
+**This service does NOT handle:** event collection/ingestion (CCE Collector Service), scheduling (CCE Scheduler Service), intelligence event delivery/routing (CCE Intelligence Service), or authentication/authorization (handled by the API Gateway). Intelligence rules are evaluated within this service and published as intelligence trigger events to Kafka; the Intelligence Service handles downstream delivery (webhooks, topic subscriptions) and action execution.
 
 ### 1.1 Scheduler Service Contract
 
@@ -145,7 +148,7 @@ org.openphc.cce.compliance
 │   ├── config/                                # Consumer/Producer factories, topic bindings
 │   ├── consumer/                              # InboundEventConsumer, SchedulerTriggerConsumer
 │   ├── model/                                 # CloudEventMessage, IntelligenceTriggerEvent
-│   └── producer/                              # (reserved for future phase)
+│   └── producer/                              # IntelligenceTriggerProducer
 ├── service/                                   # 9 business logic services + 3 supporting records
 └── web/                                       # Controllers, DTOs, DtoMapper, ExceptionHandler
 ```
@@ -173,7 +176,7 @@ flowchart TD
     S5["Step 5: Two-Tier Matching<br/>(see §5.4 for detailed flow)"] --> S6
 
     S6{"Result Classification"}
-    S6 -->|"≥1 matches"| MATCH["For each match:<br/>Enroll patient (if needed) → Create step instance<br/>→ Progressive step instantiation"]
+    S6 -->|"≥1 matches"| MATCH["For each match:<br/>Enroll patient → Create/complete step<br/>→ Progressive step instantiation<br/>→ Evaluate intelligence rules"]
     S6 -->|"0 matches"| ZERO["Log ZERO_MATCH"]
 ```
 
@@ -407,16 +410,101 @@ stateDiagram-v2
 
 Protocol completion is **automatic** — when all steps reach terminal states (`COMPLETED`, `MISSED`, `SKIPPED`), the protocol transitions to `COMPLETED`. There is no manual complete endpoint; `WITHDRAWN` covers manual termination.
 
-## 7. Security
+## 7. Intelligence Rules
+
+Intelligence rules are modeled as **nested sub-actions** within a PlanDefinition step action. They are evaluated when step state changes occur (deviation detection, step completion) and produce intelligence trigger events published to Kafka.
+
+### 7.1 Rule Structure
+
+Each intelligence rule is a nested `action` within a step's `action[]` array, containing:
+
+- **Condition** — A JSONLogic expression evaluated against the step's runtime state (e.g., `stepState == 'overdue' && daysOverdue > 3`)
+- **`definitionCanonical`** — Reference to an `ActivityDefinition` resource that defines the action to execute (e.g., send notification, create task, escalate)
+- **Extensions** — `intelligence-severity` (`low`, `medium`, `high`, `critical`) and `intelligence-target` (`patient`, `assigned_worker`, `supervisor`, `facility`)
+
+```json
+{
+  "id": "anc-visit-2-overdue-escalation",
+  "condition": [{
+    "kind": "applicability",
+    "expression": {
+      "language": "text/jsonlogic",
+      "expression": "{\"and\": [{\"==\": [{\"var\": \"stepState\"}, \"overdue\"]}, {\">\": [{\"var\": \"daysOverdue\"}, 3]}]}"
+    }
+  }],
+  "definitionCanonical": "ActivityDefinition/send-supervisor-escalation",
+  "extension": [
+    {
+      "url": "http://openphc.org/fhir/StructureDefinition/intelligence-severity",
+      "valueCode": "high"
+    },
+    {
+      "url": "http://openphc.org/fhir/StructureDefinition/intelligence-target",
+      "valueCode": "supervisor"
+    }
+  ]
+}
+```
+
+### 7.2 Evaluation Context
+
+Intelligence rule conditions are evaluated with these variables:
+
+| Variable | Type | Source |
+|---|---|---|
+| `stepState` | String | Current step state (`overdue`, `missed`, `completed`, etc.) |
+| `daysOverdue` | Long | Days past the step's `dueDate` |
+| `daysPastMissedDate` | Long | Days past the step's `missedDate` |
+| `completionStatus` | String | `early`, `on_time`, `late` (only when step is completed) |
+| `event` | Map | The triggering CloudEvent data payload |
+| `patient` | Map | Patient context (`patientId`) |
+| `protocol` | Map | Protocol context (`protocolCanonical`, `status`) |
+
+### 7.3 Evaluation Triggers
+
+Intelligence rules are evaluated at two points:
+
+1. **Deviation detection** — When the scheduler transitions a step to `OVERDUE` or `MISSED`, rules on that step are evaluated against the deviation context.
+2. **Step completion** — When a step is completed (via an inbound event), rules on that step are evaluated against the completion context (e.g., to detect late completions).
+
+### 7.4 Intelligence Event Publishing
+
+When a rule's condition evaluates to `true`, the service:
+
+1. Resolves the `definitionCanonical` to the registered `ActionDefinition`
+2. Builds an `IntelligenceTriggerEvent` with full context (patient, protocol, step, deviation, severity, target)
+3. Publishes the event to the `cce.intelligence.triggers` Kafka topic
+4. Records the `intelligence_event_id` on the deviation record (if triggered by a deviation)
+
+### 7.5 Intelligence Types
+
+| Type | Trigger | Example |
+|---|---|---|
+| **Missed Event** | Step transitioned to OVERDUE or MISSED | "ANC visit due at week 20, now 5 days overdue" |
+| **Late Completion** | Step completed with `completionStatus=LATE` | "Referral appointment was 8 days late (protocol: 7 days)" |
+| **Escalation** | Condition evaluates severity threshold | "High-risk pregnancy patient missed 2 consecutive visits" |
+| **Reminder** | Upcoming due date (scheduler-driven) | "ANC visit due in 3 days" |
+
+### 7.6 Action Definitions
+
+An **Action Definition** specifies what the Intelligence Service does when it receives an intelligence trigger event. Stored as `ActivityDefinition` resources in the compliance service and referenced by intelligence rules via `definitionCanonical`.
+
+Each Action Definition specifies:
+- **Action type** — What to do: `send-notification`, `create-task`, `forward-data`, `escalate`
+- **Message template** — Content with variable placeholders (e.g., `"Patient {{patientId}} missed {{actionId}}"`)
+- **Routing** — Which Receiver Adaptor(s) should receive the action
+- **Severity** and **target** — Default severity and target (can be overridden by intelligence rule extensions)
+
+## 8. Security
 
 - **Authentication & Authorization:** Handled by the **CCE API Gateway**. This service does not implement security directly — all requests arrive pre-authenticated.
 - Actuator endpoints are publicly accessible for health checks and monitoring.
 
 See [API Reference](api-reference.md) for endpoint details.
 
-## 8. Observability
+## 9. Observability
 
-### 8.1 Metrics
+### 9.1 Metrics
 
 | Metric | Type | Description |
 |---|---|---|
@@ -424,21 +512,21 @@ See [API Reference](api-reference.md) for endpoint details.
 | `cce.events.matched` | Counter (tagged) | By status: `matched`, `zero_match` |
 | `cce.events.duplicate` | Counter | Duplicate events detected |
 | `cce.events.zero_match` | Counter | Events with zero trigger matches |
-| `cce.events.intelligence.published` | Counter | Intelligence trigger events published (future phase) |
+| `cce.events.intelligence.published` | Counter | Intelligence trigger events published to Kafka |
 | `cce.step.matching.duration` | Timer | Tier 1 + Tier 2 matching time |
 | `cce.consumer.inbound.errors` | Counter | Inbound event consumer processing errors |
 | `cce.consumer.scheduler.errors` | Counter | Scheduler trigger consumer processing errors |
 | `cce.protocol.instances.active` | Gauge | Active protocol instances |
 
-### 8.2 Logging & Tracing
+### 9.2 Logging & Tracing
 
 - **Format:** `timestamp [thread] [correlationId] level logger - message`
 - **Tracing:** OpenTelemetry (OTLP), `correlationId` propagated via MDC and CloudEvents extensions
 - **Health:** `/actuator/health` (liveness + readiness), `/actuator/prometheus`
 
-## 9. Error Handling
+## 10. Error Handling
 
-### 9.1 REST API
+### 10.1 REST API
 
 | Error Type | HTTP Status |
 |---|---|
@@ -448,7 +536,7 @@ See [API Reference](api-reference.md) for endpoint details.
 | FHIR validation failure | 422 |
 | Internal error | 500 |
 
-### 9.2 Kafka
+### 10.2 Kafka
 
 - **Consumer errors:** Exception propagates to `DefaultErrorHandler` → retries with 1-second fixed backoff (up to 3 attempts) → routes to DLQ topic (`<topic>.dlq`) after exhausting retries
 - **Dead Letter Queue:** Failed records are published to `cce.events.inbound.dlq` or `cce.scheduler.triggers.dlq` with original headers preserved
@@ -456,7 +544,7 @@ See [API Reference](api-reference.md) for endpoint details.
 - **Producer:** Idempotent with `acks=all`
 - **Deserialization:** `ErrorHandlingDeserializer` wraps errors gracefully
 
-## 10. Scaling
+## 11. Scaling
 
 | Dimension | Strategy |
 |---|---|

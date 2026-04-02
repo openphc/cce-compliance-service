@@ -31,10 +31,10 @@ public class InboundEventConsumer {
 
     @KafkaListener(topics = "${cce.kafka.topics.inbound-events}")
     public void consume(CloudEventMessage event) {
-        MDC.put("correlationId", event.getCorrelationid());
-        MDC.put("source", event.getSource());
-        MDC.put("eventType", event.getType());
-        MDC.put("subject", event.getSubject());
+        if (event.getCorrelationid() != null) MDC.put("correlationId", event.getCorrelationid());
+        if (event.getSource() != null) MDC.put("source", event.getSource());
+        if (event.getType() != null) MDC.put("eventType", event.getType());
+        if (event.getSubject() != null) MDC.put("subject", event.getSubject());
         try {
             log.debug("Received inbound event: cloudeventsId={}, source={}", event.getId(), event.getSource());
             complianceEngine.processInboundEvent(event);

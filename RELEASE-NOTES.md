@@ -38,7 +38,21 @@ Initial release of the CCE Compliance Service — a clinical protocol compliance
 ### Deviation Detection
 - Automatic deviation recording for OVERDUE and MISSED step transitions
 - Deviation metadata includes timing details (days overdue, days past missed)
-- Intelligence trigger event schema documented for future publishing phase
+- Intelligence trigger events published to Kafka upon deviation detection
+
+### Intelligence Rules & Actions
+- **Intelligence rules** modeled as nested sub-actions within PlanDefinition steps
+- Rule conditions evaluated via JSONLogic/FHIRPath against step runtime state (stepState, daysOverdue, completionStatus)
+- Rules evaluated at two points: deviation detection (OVERDUE/MISSED) and step completion (late completion alerts)
+- **Action Definitions** (`ActivityDefinition` resources) define what to do when a rule fires: `send-notification`, `create-task`, `forward-data`, `escalate`
+- Action Definition CRUD via REST API (`POST/GET/PUT /v1/action-definitions`)
+- **Action Runs** track execution of intelligence-triggered actions
+- Action Run lifecycle: `pending → in_progress → completed/failed/cancelled`
+- Action Run query and cancel via REST API (`GET/POST /v1/action-runs`)
+- Intelligence summary endpoint (`GET /v1/intelligence/summary`) with counts by type, severity, and target
+- `IntelligenceTriggerProducer` publishes events to `cce.intelligence.triggers` Kafka topic
+- Intelligence event schema includes severity (`low/medium/high/critical`), target (`patient/assigned_worker/supervisor/facility`), and `definitionCanonical`
+- CCE extensions on PlanDefinition: `intelligence-severity`, `intelligence-target`
 
 ### Event Processing
 - CloudEvents v1.0 spec with CCE extension attributes (`correlationid`, `actionid`, `facilityid`, `protocolinstanceid`)
@@ -53,10 +67,13 @@ Initial release of the CCE Compliance Service — a clinical protocol compliance
 - `ErrorHandlingDeserializer` wrapping for poison pill protection
 
 ### REST API
-- **16 endpoints** across 3 controllers:
+- **26+ endpoints** across 5 controllers:
   - Protocol Definitions (8): load, list, get by ID, get by URL, get by URL+version, retire, rebuild-index, delete
   - Protocol Instances (2): get by ID, withdraw
   - Patient Tracking (6): list instances, active instances, instance detail, steps, deviations, events
+  - Action Definitions (4): register, list, get by ID, update
+  - Action Runs (4): list, get by ID, get status, cancel
+  - Intelligence (1): summary
 - Structured error responses via `GlobalExceptionHandler`
 - DTOs mapped via `DtoMapper` — entities never exposed in responses
 
@@ -87,6 +104,8 @@ Kafka ─→ InboundEventConsumer ─→ ComplianceEngine
                                     ├── Enrollment (ProtocolInstanceService)
                                     ├── Step Management (StepInstanceService)
                                     ├── Deviation Detection (DeviationService)
+                                    ├── Intelligence Rules (IntelligenceRuleService)
+                                    ├── Action Definitions (ActionDefinitionService)
                                     └── Audit Logging (AuditService)
 ```
 
@@ -94,7 +113,7 @@ Kafka ─→ InboundEventConsumer ─→ ComplianceEngine
 
 ## Database Schema
 
-7 tables managed via Flyway:
+9 tables managed via Flyway:
 - `protocol_definition` — FHIR PlanDefinition storage with JSONB definition column
 - `protocol_instance` — Patient enrollment tracking
 - `step_instance` — Individual step state tracking
@@ -102,16 +121,18 @@ Kafka ─→ InboundEventConsumer ─→ ComplianceEngine
 - `trigger_index` — Decomposed codeFilter entries for Tier 1 matching (composite PK)
 - `event_log` — Inbound event log with idempotency constraint
 - `audit_log` — Audit trail for all operations
+- `action_definition` — Intelligence action definitions (ActivityDefinition resources)
+- `action_run` — Intelligence action execution records
 
 ---
 
 ## Known Limitations (v1.0.0)
 
 - **No CQL support:** Only JSONLogic (`text/jsonlogic`) and FHIRPath (`text/fhirpath`) expression languages are supported. CQL evaluation was removed from scope.
-- **Intelligence trigger publishing deferred:** `IntelligenceTriggerEvent` model exists for schema documentation, but no Kafka producer or publishing logic is implemented. This is deferred to a future phase, driven by PlanDefinition-level configuration.
 - **`cce.protocol.control` topic reserved:** Reserved for future use — not implemented in 1.0.0.
 - **No multi-tenancy:** Single-tenant deployment assumed.
 - **No authentication at service level:** Security is handled by the CCE API Gateway.
+- **Intelligence event delivery is external:** The Compliance Service publishes intelligence trigger events to Kafka. Actual delivery to Receiver Adaptors (webhooks, topic subscriptions) is handled by the CCE Intelligence Service.
 
 ---
 

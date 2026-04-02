@@ -45,6 +45,7 @@ class ComplianceEngineTest {
     @Mock private ProtocolInstanceService protocolInstanceService;
     @Mock private StepInstanceService stepInstanceService;
     @Mock private PlanDefinitionParser planDefinitionParser;
+    @Mock private IntelligenceRuleService intelligenceRuleService;
     @Mock private AuditService auditService;
 
     private MeterRegistry meterRegistry;
@@ -59,7 +60,8 @@ class ComplianceEngineTest {
         engine = new ComplianceEngine(eventLogService, resourceInfoExtractor,
                 triggerMatchingService, expressionEvaluationService,
                 protocolDefinitionService, protocolInstanceService,
-                stepInstanceService, planDefinitionParser, auditService, meterRegistry);
+                stepInstanceService, planDefinitionParser, intelligenceRuleService,
+                auditService, meterRegistry);
     }
 
     @Nested

@@ -219,7 +219,7 @@ All CCE services share the same PostgreSQL database (`cce_collector`) deployed b
 
 The database and user are created by the collector service's Docker Compose. The compliance service only needs to run its Flyway migrations, which happen automatically on startup.
 
-> **Compliance service tables:** `protocol_definition`, `protocol_instance`, `step_instance`, `deviation`, `trigger_index`, `event_log`, `audit_log`
+> **Compliance service tables:** `protocol_definition`, `protocol_instance`, `step_instance`, `deviation`, `trigger_index`, `event_log`, `audit_log`, `action_definition`, `action_run`
 
 ### Schema Migrations
 

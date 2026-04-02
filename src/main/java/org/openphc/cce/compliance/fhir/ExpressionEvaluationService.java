@@ -19,7 +19,10 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.io.StringReader;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Collections;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Component
@@ -29,12 +32,19 @@ public class ExpressionEvaluationService {
 
     private static final String LANGUAGE_JSONLOGIC = "text/jsonlogic";
     private static final String LANGUAGE_FHIRPATH = "text/fhirpath";
+    private static final int MAX_RULE_CACHE_SIZE = 1000;
 
     private final JohnzonJsonLogic jsonLogic;
     private final IFhirPath fhirPath;
     private final IParser fhirJsonParser;
     private final ObjectMapper objectMapper;
-    private final ConcurrentHashMap<String, JsonValue> jsonLogicRuleCache = new ConcurrentHashMap<>();
+    private final Map<String, JsonValue> jsonLogicRuleCache = Collections.synchronizedMap(
+            new LinkedHashMap<>(64, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, JsonValue> eldest) {
+                    return size() > MAX_RULE_CACHE_SIZE;
+                }
+            });
 
     public ExpressionEvaluationService(FhirContext fhirContext, ObjectMapper objectMapper) {
         this.fhirPath = fhirContext.newFhirPath();
