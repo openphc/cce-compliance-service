@@ -273,31 +273,27 @@ Tracks an **individual action occurrence** within a patient's protocol journey. 
 
 ```
                    ┌──────────┐
-         ┌─────────│ PENDING  │─────────┐
-         │         └────┬─────┘         │
-         │   scheduler  │               │ event match
-         │   (due_date  │               │ (completes)
-         │    reached)  ▼               ▼
-         │         ┌──────────┐    ┌───────────┐
-         │         │   DUE    │───▶│ COMPLETED │
-         │         └────┬─────┘    └───────────┘
-         │   tolerance  │               ▲
-         │   window     │               │ event match
-         │   expired    ▼               │
-         │         ┌──────────┐         │
-         │         │ OVERDUE  │─────────┘
-         │         └────┬─────┘
-         │   missed     │
-         │   cutoff     ▼
-         │         ┌──────────┐
-         │         │  MISSED  │    (must)
-         │         └──────────┘
-         │   missed     │
-         │   cutoff     │ (could)
-         │   (could)    ▼
-         │         ┌──────────┐
-         │         │ SKIPPED  │
-         │         └──────────┘
+                   │ PENDING  │─────────┐
+                   └────┬─────┘         │
+         scheduler      │               │ event match
+         (due_date      │               │ (completes)
+          reached)      ▼               ▼
+                   ┌──────────┐    ┌───────────┐
+                   │   DUE    │───▶│ COMPLETED │
+                   └────┬─────┘    └───────────┘
+         tolerance      │               ▲
+         window         │               │ event match
+         expired        ▼               │
+                   ┌──────────┐         │
+                   │ OVERDUE  │─────────┘
+                   └────┬─────┘
+                        │
+              ┌─────────┴─────────┐
+              ▼                   ▼
+         ┌──────────┐       ┌──────────┐
+         │  MISSED  │       │ SKIPPED  │
+         └──────────┘       └──────────┘
+           (must)             (could)
 ```
 
 ---
