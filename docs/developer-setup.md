@@ -2,6 +2,8 @@
 
 ## 1. Prerequisites
 
+> **Full technology stack:** See [architecture-overview.md §2](architecture-overview.md#2-technology-stack) for the complete technology stack with versions and purpose.
+
 | Tool | Version | Required | Purpose |
 |---|---|---|---|
 | **Java JDK** | 21 LTS | Yes | Build and runtime |
@@ -95,14 +97,9 @@ All configuration can be overridden via environment variables:
 
 ### 3.2 Kafka Topic Configuration
 
-Configured via `cce.kafka.topics.*` in `application.yml`:
+Topic names are configured via `cce.kafka.topics.*` in `application.yml`. The service auto-creates 5 topics on startup (3 primary + 2 DLQ, 25 partitions each).
 
-| Property | Default Value | Description |
-|---|---|---|
-| `cce.kafka.topics.inbound-events` | `cce.events.inbound` | Inbound clinical events |
-| `cce.kafka.topics.scheduler-triggers` | `cce.scheduler.triggers` | Scheduler timer triggers |
-| `cce.kafka.topics.intelligence-triggers` | `cce.intelligence.triggers` | Outbound deviation events |
-| `cce.kafka.topics.protocol-control` | `cce.protocol.control` | Protocol lifecycle (reserved) |
+> **Complete topic inventory, consumer/producer configuration, and retry policies:** See [kafka-events.md](kafka-events.md).
 
 ### 3.3 JPA & Hibernate
 

@@ -116,6 +116,72 @@ Each condition maps to a specific `transitionType`:
 
 > **Key invariant:** The Scheduler Service is a **read-only observer** of `step_instance`. It detects when a time threshold is crossed and notifies the Compliance Service via Kafka. The Compliance Service is the sole authority for state transitions — this ensures all business rules (requiredBehavior, deviation recording, auto-skip) are enforced in one place.
 
+### 1.2 Intelligence Service Contract
+
+The **CCE Intelligence Service** is a downstream consumer that receives intelligence trigger events from the Compliance Service and handles delivery to external systems via Receiver Adaptors. Communication between the two services is **exclusively via Kafka** — there are no direct service-to-service HTTP calls.
+
+```mermaid
+sequenceDiagram
+    participant Engine as ComplianceEngine
+    participant RuleSvc as IntelligenceRuleService
+    participant ExprSvc as ExpressionEvaluationService
+    participant ActionDefSvc as ActionDefinitionService
+    participant Producer as IntelligenceTriggerProducer
+    participant Kafka as Apache Kafka
+    participant IntelSvc as CCE Intelligence Service
+    participant Adaptor as Receiver Adaptor(s)
+
+    Engine->>RuleSvc: evaluateOnDeviation() / evaluateOnCompletion()
+    RuleSvc->>RuleSvc: Parse PlanDefinition, find nested sub-actions
+    loop For each intelligence rule (sub-action)
+        RuleSvc->>ExprSvc: Evaluate applicability condition<br/>(JSONLogic/FHIRPath against step context)
+        ExprSvc-->>RuleSvc: true / false
+
+        alt Condition met
+            RuleSvc->>ActionDefSvc: Resolve definitionCanonical<br/>→ ActionDefinition
+            ActionDefSvc-->>RuleSvc: ActionDefinition (type, template, routing)
+            RuleSvc->>RuleSvc: Build IntelligenceTriggerEvent<br/>+ create ActionRun record
+            RuleSvc->>Producer: publish(event)
+            Producer->>Kafka: Send to cce.intelligence.triggers<br/>(key = protocolInstanceId)
+        end
+    end
+
+    Kafka->>IntelSvc: Consume intelligence trigger events
+    IntelSvc->>IntelSvc: Resolve routing, format message
+    IntelSvc->>Adaptor: Deliver via webhook or topic subscription
+    Adaptor->>Adaptor: Translate to target system action<br/>(notification, task, data forward)
+```
+
+#### Intelligence Trigger Event Schema
+
+The `IntelligenceTriggerEvent` published to Kafka carries full context — patient, protocol, step, deviation, severity, target, and resolved `ActionDefinition` reference — so the Intelligence Service can act without calling back to the Compliance Service. Key fields include `id`, `type`, `subject` (patientId), `protocolInstanceId`, `stepInstanceId`, `severity`, `target`, and `definitionCanonical`.
+
+> **Full schema:** See [kafka-events.md §5.3](kafka-events.md#53-intelligencetriggerevent-schema) for the complete field-by-field schema with types and examples.
+
+#### Delivery Modes
+
+The Intelligence Service supports two delivery modes to Receiver Adaptors:
+
+| Mode | How It Works | Best For |
+|---|---|---|
+| **Webhook (Push)** | Intelligence Service POSTs events to the adaptor's registered URL | Simple integrations; always-online systems |
+| **Topic Subscription (Pull)** | Adaptor subscribes to a message topic; pulls events at its own pace | Robust integrations; systems with potential downtime |
+
+#### Ownership & Coordination
+
+| Aspect | Owner | Details |
+|---|---|---|
+| **Intelligence rule evaluation** | Compliance Service | Parses PlanDefinition sub-actions, evaluates conditions, builds events |
+| **`action_definition` table** | Compliance Service | Stores `ActivityDefinition` resources referenced by intelligence rules |
+| **`action_run` table** | Compliance Service | Records each intelligence rule firing with resolved message and status |
+| **Event publishing** | Compliance Service | `IntelligenceTriggerProducer` publishes to `cce.intelligence.triggers` |
+| **Event consumption** | Intelligence Service | Consumes events, resolves routing, delivers to Receiver Adaptors |
+| **Action execution** | Receiver Adaptors | Translate intelligence events into target system actions (notifications, tasks, data forwards) |
+| **Kafka topic** | Shared | `cce.intelligence.triggers` — Compliance produces, Intelligence consumes |
+| **Partition key** | Compliance Service | `protocolInstanceId` ensures all events for a protocol go to the same partition |
+
+> **Key invariant:** The Compliance Service is the **sole producer** of intelligence trigger events. It evaluates all intelligence rules locally and publishes fully self-contained events — the Intelligence Service never calls back to the Compliance Service for additional context. This ensures the two services are fully decoupled and can scale independently.
+
 ## 2. Technology Stack
 
 | Category | Technology | Version | Purpose |
@@ -156,6 +222,8 @@ org.openphc.cce.compliance
 ## 4. Core Pipeline — ComplianceEngine
 
 The `ComplianceEngine` is the central orchestrator. All inbound event processing flows through it:
+
+> **Detailed sequence diagram:** See [flow-diagrams.md §1](flow-diagrams.md#1-inbound-clinical-event-processing) for the full service-interaction sequence.
 
 ```mermaid
 flowchart TD
@@ -404,6 +472,8 @@ stateDiagram-v2
 
 **Required behavior:** Steps with `requiredBehavior=could` (from `PlanDefinition.action.requiredBehavior`) are optional. When the scheduler fires `OVERDUE_TO_MISSED` on a `could` step, it transitions to `SKIPPED` (no deviation) instead of `MISSED`. Additionally, when any step completes, preceding `could` steps still in actionable states are auto-skipped.
 
+> **Complete state machine with enum values:** See [data-dictionary.md §5](data-dictionary.md#5-step-instance-state-machine) for the full state machine reference including all enum values and transition rules.
+
 ### 6.2 Protocol Instance
 
 `ACTIVE → COMPLETED | WITHDRAWN | EXPIRED`. Terminal states: `COMPLETED`, `WITHDRAWN`, `EXPIRED`.
@@ -542,11 +612,11 @@ See [API Reference](api-reference.md) for endpoint details.
 
 ### 10.2 Kafka
 
-- **Consumer errors:** Exception propagates to `DefaultErrorHandler` → retries with 1-second fixed backoff (up to 3 attempts) → routes to DLQ topic (`<topic>.dlq`) after exhausting retries
-- **Dead Letter Queue:** Failed records are published to `cce.events.inbound.dlq` or `cce.scheduler.triggers.dlq` with original headers preserved
-- **Retry configuration:** `cce.kafka.retry.max-attempts` (default 3), `cce.kafka.retry.backoff-interval-ms` (default 1000)
+- **Consumer errors:** `DefaultErrorHandler` with configurable retry + DLQ routing
 - **Producer:** Idempotent with `acks=all`
 - **Deserialization:** `ErrorHandlingDeserializer` wraps errors gracefully
+
+> **Detailed retry policy, DLQ configuration, and error recovery flow:** See [kafka-events.md §3.3](kafka-events.md#33-retry--dead-letter-queue) and [§9](kafka-events.md#9-error-recovery).
 
 ## 11. Scaling
 

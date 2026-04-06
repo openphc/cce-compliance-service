@@ -22,6 +22,8 @@
 
 ## 1. Infrastructure Requirements
 
+> **Full technology stack:** See [architecture-overview.md §2](architecture-overview.md#2-technology-stack) for the complete technology stack with versions and purpose.
+
 | Component | Version | Purpose | Notes |
 |---|---|---|---|
 | **Java JDK** | 21 LTS | Runtime | Eclipse Temurin recommended |
@@ -251,37 +253,25 @@ The CCE Compliance Service shares the Kafka cluster deployed by the [CCE Collect
 
 ### Topics
 
-The service auto-creates topics on startup via `KafkaAdmin` + `NewTopic` beans. For production, pre-create topics with appropriate replication:
+The service auto-creates 5 topics on startup via `KafkaAdmin` + `NewTopic` beans (3 primary + 2 DLQ, 25 partitions each). For production, pre-create topics with `--replication-factor 3`.
+
+> **Topic names, partitions, consumer groups, and detailed configuration:** See [kafka-events.md §2](kafka-events.md#2-topic-inventory) for the complete topic inventory.
+
+Production topic creation example:
 
 ```bash
-# Primary topics
-kafka-topics.sh --create --topic cce.events.inbound \
-  --partitions 25 --replication-factor 3 --bootstrap-server kafka:9092
-
-kafka-topics.sh --create --topic cce.scheduler.triggers \
-  --partitions 25 --replication-factor 3 --bootstrap-server kafka:9092
-
-kafka-topics.sh --create --topic cce.intelligence.triggers \
-  --partitions 25 --replication-factor 3 --bootstrap-server kafka:9092
-
-# DLQ topics
-kafka-topics.sh --create --topic cce.events.inbound.dlq \
-  --partitions 25 --replication-factor 3 --bootstrap-server kafka:9092
-
-kafka-topics.sh --create --topic cce.scheduler.triggers.dlq \
-  --partitions 25 --replication-factor 3 --bootstrap-server kafka:9092
+for topic in cce.events.inbound cce.scheduler.triggers cce.intelligence.triggers \
+             cce.events.inbound.dlq cce.scheduler.triggers.dlq; do
+  kafka-topics.sh --create --topic $topic \
+    --partitions 25 --replication-factor 3 --bootstrap-server kafka:9092
+done
 ```
-
-### Consumer Group
-
-- **Group ID:** `cce-compliance-service`
-- **Auto offset reset:** `earliest`
-- **Isolation level:** `read_committed`
-- **Max poll records:** 200 (prod)
 
 ### Error Handling
 
-Failed messages are retried with `FixedBackOff` (5 attempts × 2s interval in prod), then routed to the corresponding `.dlq` topic. Monitor DLQ topics for persistent failures.
+Failed messages are retried with configurable backoff, then routed to the corresponding `.dlq` topic. Monitor DLQ topics for persistent failures.
+
+> **Retry policy, DLQ routing, and error recovery details:** See [kafka-events.md §3.3](kafka-events.md#33-retry--dead-letter-queue) and [§9](kafka-events.md#9-error-recovery).
 
 ---
 
@@ -330,6 +320,8 @@ JAVA_OPTS="\
 | `/actuator/metrics` | Micrometer metrics browser |
 
 ### Key Metrics to Monitor
+
+> **Complete metrics catalog:** See [architecture-overview.md §9.1](architecture-overview.md#91-metrics) for the full list of all application metrics. The table below highlights production-critical thresholds.
 
 | Metric | Type | Alert Threshold |
 |---|---|---|
