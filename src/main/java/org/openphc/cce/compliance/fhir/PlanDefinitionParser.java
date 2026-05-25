@@ -130,6 +130,15 @@ public class PlanDefinitionParser {
                                     "At least one of data[] or condition must be present.");
                 }
             }
+
+            // A group step (has sub-steps) must not have its own triggers —
+            // triggers on the parent would bypass group completion semantics.
+            boolean hasSubSteps = action.getAction().stream().anyMatch(this::isSubStep);
+            if (hasSubSteps && !action.getTrigger().isEmpty()) {
+                throw new IllegalArgumentException(
+                        "Action '" + action.getId() + "' has both triggers and sub-steps. " +
+                                "A group step must not have its own triggers — completion is delegated to sub-steps.");
+            }
         }
     }
 

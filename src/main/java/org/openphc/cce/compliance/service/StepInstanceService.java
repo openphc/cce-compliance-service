@@ -94,18 +94,12 @@ public class StepInstanceService {
                 : OffsetDateTime.now(ZoneOffset.UTC);
 
         for (PlanDefinitionParser.SubStepActionInfo subStepInfo : subStepInfos) {
-            // Only create sub-steps that have no relatedAction dependencies within the group
-            // (i.e., root sub-steps). Dependent sub-steps are created progressively.
-            boolean hasDependency = subStepInfos.stream()
-                    .anyMatch(other -> other.relatedActions().stream()
-                            .anyMatch(ra -> subStepInfo.id().equals(ra.actionId())));
-            // If this sub-step is a target of another sub-step's relatedAction, skip initial creation
-            // Actually, we want to find sub-steps that DO NOT depend on others (entry points)
+            // Only create entry-point sub-steps (those that don't depend on a sibling).
+            // Dependent sub-steps are created progressively when their prerequisite completes.
             boolean dependsOnSibling = subStepInfo.relatedActions().stream()
                     .anyMatch(ra -> subStepInfos.stream().anyMatch(s -> s.id().equals(ra.actionId())));
 
             if (dependsOnSibling) {
-                // This sub-step depends on a sibling — will be created by progressive instantiation
                 continue;
             }
 
@@ -173,8 +167,13 @@ public class StepInstanceService {
 
         // If this is a sub-step, handle group completion logic
         if (step.getParentStepId() != null) {
-            createDependentSubSteps(step);
-            evaluateGroupCompletion(step);
+            // Parse once — reused by both methods
+            var definition = step.getProtocolInstance().getProtocolDefinition().getDefinition();
+            var planDefinition = planDefinitionParser.parse(definition.toString());
+            var actions = planDefinitionParser.extractActions(planDefinition);
+
+            createDependentSubSteps(step, actions);
+            evaluateGroupCompletion(step, actions);
             return;
         }
 
@@ -442,15 +441,11 @@ public class StepInstanceService {
      * Create dependent sub-steps within the same parent group when a sibling sub-step completes.
      * Uses relatedAction definitions scoped within the parent's sub-step list.
      */
-    private void createDependentSubSteps(StepInstance completedSubStep) {
+    private void createDependentSubSteps(StepInstance completedSubStep,
+                                         List<PlanDefinitionParser.ActionMetadata> actions) {
         ProtocolInstance protocolInstance = completedSubStep.getProtocolInstance();
         UUID parentStepId = completedSubStep.getParentStepId();
         String parentActionId = completedSubStep.getParentActionId();
-
-        // Parse protocol to find the parent action's sub-steps
-        var definition = protocolInstance.getProtocolDefinition().getDefinition();
-        var planDefinition = planDefinitionParser.parse(definition.toString());
-        var actions = planDefinitionParser.extractActions(planDefinition);
 
         PlanDefinitionParser.ActionMetadata parentActionMetadata = actions.stream()
                 .filter(a -> parentActionId.equals(a.id()))
@@ -473,6 +468,18 @@ public class StepInstanceService {
 
         // Create dependent sub-steps
         for (PlanDefinitionParser.RelatedActionInfo relatedAction : completedSubStepInfo.relatedActions()) {
+            // Guard: skip if this sub-step already exists for the same parent
+            StepInstance existing = stepInstanceRepository
+                    .findByProtocolInstanceIdAndActionIdAndStateIn(
+                            protocolInstance.getId(), relatedAction.actionId(), ACTIONABLE_STATES)
+                    .stream()
+                    .filter(s -> parentStepId.equals(s.getParentStepId()))
+                    .findFirst()
+                    .orElse(null);
+            if (existing != null) {
+                continue;
+            }
+
             OffsetDateTime baseTime = "after-start".equals(relatedAction.relationship())
                     ? completedSubStep.getDueDate()
                     : completedSubStep.getCompletedAt();
@@ -528,7 +535,8 @@ public class StepInstanceService {
      * - "at-most-one": at most one sub-step completes the parent
      * - "one-or-more": at least one sub-step completes the parent
      */
-    private void evaluateGroupCompletion(StepInstance completedSubStep) {
+    private void evaluateGroupCompletion(StepInstance completedSubStep,
+                                          List<PlanDefinitionParser.ActionMetadata> actions) {
         UUID parentStepId = completedSubStep.getParentStepId();
         StepInstance parentStep = findByIdOrThrow(parentStepId);
 
@@ -540,11 +548,8 @@ public class StepInstanceService {
         // Get all sibling sub-steps
         List<StepInstance> childSteps = stepInstanceRepository.findByParentStepId(parentStepId);
 
-        // Look up the parent action's selectionBehavior from the protocol definition
+        // Look up the parent action's selectionBehavior
         String parentActionId = completedSubStep.getParentActionId();
-        var definition = parentStep.getProtocolInstance().getProtocolDefinition().getDefinition();
-        var planDefinition = planDefinitionParser.parse(definition.toString());
-        var actions = planDefinitionParser.extractActions(planDefinition);
 
         PlanDefinitionParser.ActionMetadata parentActionMetadata = actions.stream()
                 .filter(a -> parentActionId.equals(a.id()))
@@ -605,7 +610,7 @@ public class StepInstanceService {
         return switch (selectionBehavior) {
             case "any", "one-or-more" -> completedCount >= 1;
             case "exactly-one", "at-most-one" -> completedCount == 1;
-            case "all-or-none" -> completedCount == childSteps.size() || completedCount == 0;
+            case "all-or-none" -> completedCount == childSteps.size();
             default -> terminalCount == childSteps.size();
         };
     }
