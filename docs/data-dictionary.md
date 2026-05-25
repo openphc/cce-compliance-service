@@ -2,7 +2,7 @@
 
 > **CCE Compliance Service** — Complete database schema reference  
 > **Database**: PostgreSQL 16 | **Schema**: `public` | **Migration**: Flyway  
-> **Last Updated**: 2026-03-09
+> **Last Updated**: 2026-05-25
 
 ---
 
@@ -34,6 +34,7 @@ erDiagram
     PROTOCOL_INSTANCE ||--o{ STEP_INSTANCE : "contains"
     PROTOCOL_INSTANCE ||--o{ DEVIATION : "has"
     STEP_INSTANCE ||--o{ DEVIATION : "causes"
+    STEP_INSTANCE ||--o{ STEP_INSTANCE : "parent of (sub-steps)"
 
     PROTOCOL_DEFINITION {
         uuid id PK
@@ -69,6 +70,8 @@ erDiagram
         varchar completion_status
         uuid matched_event_id
         varchar required_behavior
+        uuid parent_step_id FK
+        varchar parent_action_id
         timestamptz created_at
         timestamptz updated_at
     }
@@ -238,7 +241,7 @@ Represents a **patient's enrollment** in a specific compliance protocol. Created
 
 ## 5. step_instance
 
-Tracks an **individual action occurrence** within a patient's protocol journey. Each step corresponds to a single `action` from the protocol definition. Steps follow a state machine lifecycle: `PENDING → DUE → OVERDUE → MISSED` (scheduler-driven, for `must` steps) or `→ SKIPPED` (scheduler-driven, for `could` steps) or `→ COMPLETED` (event-driven). Repeating steps are differentiated by `repeat_index`.
+Tracks an **individual action occurrence** within a patient's protocol journey. Each step corresponds to a single `action` from the protocol definition. Steps follow a state machine lifecycle: `PENDING → DUE → OVERDUE → MISSED` (scheduler-driven, for `must` steps) or `→ SKIPPED` (scheduler-driven, for `could` steps) or `→ COMPLETED` (event-driven). Repeating steps are differentiated by `repeat_index`. Sub-steps reference their parent group step via `parent_step_id`.
 
 ### Columns
 
@@ -257,6 +260,8 @@ Tracks an **individual action occurrence** within a patient's protocol journey. 
 | `completion_status` | `VARCHAR` | Yes | — | Timeliness classification. See [CompletionStatus](#completionstatus). |
 | `matched_event_id` | `UUID` | Yes | — | Links to `event_log.id` that completed this step. |
 | `required_behavior` | `VARCHAR` | Yes | — | FHIR `requiredBehavior` code from `PlanDefinition.action`: `must`, `could`, or `must-unless-documented`. Determines whether the step produces a deviation on non-completion. |
+| `parent_step_id` | `UUID` | Yes | — | Foreign key → `step_instance.id`. Non-null for sub-steps — references the parent group step. |
+| `parent_action_id` | `VARCHAR` | Yes | — | The `action.id` of the parent group action in the PlanDefinition. Stored for fast lookup without re-parsing. |
 | `created_at` | `TIMESTAMPTZ` | **NOT NULL** | `now()` | Record creation timestamp. |
 | `updated_at` | `TIMESTAMPTZ` | **NOT NULL** | `now()` | Last modification timestamp. |
 
@@ -266,10 +271,12 @@ Tracks an **individual action occurrence** within a patient's protocol journey. 
 |------|------|---------|
 | Primary Key | `step_instance_pkey` | `id` |
 | Foreign Key | `step_instance_protocol_instance_id_fkey` | `protocol_instance_id` → `protocol_instance(id)` |
+| Foreign Key | `step_instance_parent_step_id_fkey` | `parent_step_id` → `step_instance(id)` |
 | Check | — | `state IN ('PENDING', 'DUE', 'OVERDUE', 'MISSED', 'COMPLETED', 'SKIPPED')` |
 | Check | — | `completion_status IN ('ON_TIME', 'EARLY', 'LATE')` |
 | Check | — | `required_behavior IN ('must', 'could', 'must-unless-documented')` |
 | B-tree Index | `idx_step_instance_protocol` | `protocol_instance_id` — All steps within a protocol instance. |
+| B-tree Index | `idx_step_instance_parent_step_id` | `parent_step_id` — All sub-steps for a given parent group step. |
 | Partial B-tree | `idx_step_instance_state` | `state WHERE state IN ('PENDING', 'DUE', 'OVERDUE')` — Active (non-terminal) steps. |
 | Partial B-tree | `idx_step_instance_due_date` | `due_date WHERE state IN ('PENDING', 'DUE', 'OVERDUE')` — Scheduler time-based transitions. |
 

@@ -516,38 +516,48 @@ The table below maps CCE domain concepts to their FHIR PlanDefinition counterpar
 |---|---|---|
 | **Protocol Definition** | `PlanDefinition` | The clinical protocol (e.g., ANC High-Risk Monitoring) |
 | **Protocol Step** | `PlanDefinition.action` | A step in the protocol (e.g., "ANC Visit 2") |
-| **Intelligence Action** | `PlanDefinition.action.action` | A nested action that defines a conditional intelligence evaluation |
+| **Group Step** | `PlanDefinition.action` (with nested sub-steps) | A container step whose completion is delegated to sub-steps |
+| **Sub-Step** | `PlanDefinition.action.action` (type=sub-step) | A nested action with its own trigger, tracked as a child step |
+| **Intelligence Action** | `PlanDefinition.action.action` (type=fire-event) | A nested action that defines a conditional intelligence evaluation |
 
 ```mermaid
 flowchart LR
     subgraph "FHIR PlanDefinition Structure"
         PD["PlanDefinition"]
         A1["action"]
-        A2["action"]
-        IA1["action.action"]
-        IA2["action.action"]  
-        IA3["action.action"]
+        A2["action (group)"]
+        IA1["action.action<br/>type=fire-event"]
+        IA2["action.action<br/>type=fire-event"]  
+        SS1["action.action<br/>type=sub-step"]
+        SS2["action.action<br/>type=sub-step"]
+        IA3["action.action<br/>type=fire-event"]
 
         PD --> A1
         PD --> A2
         A1 --> IA1
         A1 --> IA2
-        A2 --> IA3
+        A2 --> SS1
+        A2 --> SS2
+        SS1 --> IA3
     end
 
     subgraph "CCE Domain Model"
         PROTO["Protocol Definition"]
         S1["Step: anc-visit-1"]
-        S2["Step: anc-visit-2"]
+        S2["Group Step: lab-workup"]
         R1["Intelligence Action:<br/>overdue-escalation"]
         R2["Intelligence Action:<br/>missed-notification"]
-        R3["Intelligence Action:<br/>late-completion-alert"]
+        SUB1["Sub-Step: blood-test"]
+        SUB2["Sub-Step: urine-test"]
+        R3["Intelligence Action:<br/>lab-overdue-alert"]
 
         PROTO --> S1
         PROTO --> S2
         S1 --> R1
         S1 --> R2
-        S2 --> R3
+        S2 --> SUB1
+        S2 --> SUB2
+        SUB1 --> R3
     end
 
     PD -.- PROTO
@@ -555,6 +565,8 @@ flowchart LR
     A2 -.- S2
     IA1 -.- R1
     IA2 -.- R2
+    SS1 -.- SUB1
+    SS2 -.- SUB2
     IA3 -.- R3
 ```
 
@@ -621,6 +633,95 @@ Each **intelligence action** (`PlanDefinition.action.action`) contains:
 | `evaluation_context` | Runtime variables passed to the condition evaluator |
 
 All execution and evaluation context is stored in a single row — no FK constraints, no joins required. See [Data Dictionary §11](data-dictionary.md#11-intelligence_event_log).
+
+### 6.4 Sub-Step Groups
+
+A **group step** is a `PlanDefinition.action` that contains nested `action.action[]` entries with `type.coding[0].code = "sub-step"`. Group steps have no trigger of their own — they are created via `relatedAction` from a predecessor, and their completion is delegated to their sub-steps.
+
+#### Classification Rules
+
+Nested actions (`action.action[]`) are classified by the parser:
+
+| Criterion | Classification |
+|---|---|
+| Explicit `type.coding[0].code = "sub-step"` | Sub-step |
+| Explicit `type.coding[0].code = "fire-event"` | Intelligence action |
+| No type + has `trigger[]` | Sub-step (heuristic) |
+| No type + has `condition` + `definitionCanonical` + severity | Intelligence action (backward-compatible) |
+
+**Validation:** An action with both triggers AND sub-steps is rejected at load time (mutually exclusive patterns).
+
+#### Group Completion Semantics
+
+The parent's `selectionBehavior` determines when the group auto-completes:
+
+| `selectionBehavior` | Group completes when... |
+|---|---|
+| `all` (default) | All sub-steps reach a terminal state and at least one completed |
+| `any` | Any single sub-step completes |
+| `one-or-more` | At least one sub-step completes |
+| `exactly-one` | Exactly one sub-step completes |
+| `at-most-one` | Exactly one sub-step completes |
+| `all-or-none` | All sub-steps complete |
+
+#### Trigger Indexing
+
+Sub-step triggers are indexed in `trigger_index` using a **composite actionId** format: `"parentActionId/subStepId"`. This enables the Tier 1 query to match sub-step triggers and route them correctly through the engine.
+
+#### Sub-Step Lifecycle
+
+```mermaid
+sequenceDiagram
+    participant Engine as ComplianceEngine
+    participant SIS as StepInstanceService
+    participant DB as step_instance
+
+    Note over Engine: Event matches composite actionId "parent/child"
+    Engine->>SIS: findActionableStep(protocolId, parentActionId)
+    alt Parent doesn't exist
+        Engine->>SIS: createStep(parent) → PENDING
+        Engine->>SIS: createSubSteps(parent, subStepInfos)
+        SIS->>DB: Create entry-point sub-steps (no sibling dependencies)
+    end
+    Engine->>SIS: findActionableStep(protocolId, subStepActionId)
+    Engine->>SIS: completeStep(subStep)
+    SIS->>SIS: createDependentSubSteps(subStep)
+    SIS->>SIS: evaluateGroupCompletion(subStep)
+    alt Group complete (per selectionBehavior)
+        SIS->>DB: parent.state = COMPLETED
+        SIS->>SIS: createDependentSteps(parent) [top-level progressive instantiation]
+    end
+```
+
+#### PlanDefinition Sub-Step Structure
+
+```json
+{
+  "id": "lab-workup",
+  "title": "Lab Workup Group",
+  "selectionBehavior": "all",
+  "action": [
+    {
+      "id": "blood-test",
+      "type": { "coding": [{ "code": "sub-step" }] },
+      "title": "Blood Test",
+      "trigger": [{ "data": [{ "type": "Observation", "codeFilter": [...] }] }],
+      "extension": [{ "url": ".../tolerance-days", "valueInteger": 3 }],
+      "requiredBehavior": "must"
+    },
+    {
+      "id": "urine-test",
+      "type": { "coding": [{ "code": "sub-step" }] },
+      "title": "Urine Test",
+      "trigger": [{ "data": [{ "type": "Observation", "codeFilter": [...] }] }],
+      "relatedAction": [{ "actionId": "blood-test", "relationship": "after-end" }],
+      "requiredBehavior": "must"
+    }
+  ]
+}
+```
+
+In this example, `blood-test` is created immediately when the group is instantiated (entry-point sub-step). `urine-test` depends on `blood-test` and is created progressively when `blood-test` completes.
 
 ## 7. Security
 

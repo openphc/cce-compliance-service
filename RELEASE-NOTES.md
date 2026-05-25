@@ -1,6 +1,6 @@
-# Release Notes — v1.1.0
+# Release Notes — v1.2.0
 
-**Release Date:** 2026  
+**Release Date:** 2026-05  
 **Component:** `cce-compliance-service`  
 **Java:** 21 LTS | **Spring Boot:** 3.4.2 | **PostgreSQL:** 16 | **Kafka:** 3.x KRaft
 
@@ -8,67 +8,49 @@
 
 ## Overview
 
-Release 1.1.0 adds the Intelligence Pipeline — end-to-end evaluation, recording, and publishing of intelligence actions defined within FHIR `PlanDefinition` protocols. When a step deviation is detected (OVERDUE/MISSED) or a step is completed, nested intelligence actions are evaluated against runtime context using JSONLogic/FHIRPath conditions. Matching actions resolve to `ActivityDefinition`-backed action definitions, create an `IntelligenceEventLog` record, and publish trigger events to Kafka for downstream processing by the CCE Intelligence Service.
+Release 1.2.0 adds **sub-step group support** — the ability to decompose a protocol step into independently-triggerable child steps with group completion semantics. Sub-steps are modeled as nested `PlanDefinition.action.action[]` entries with `type.coding[0].code = "sub-step"`, indexed in `trigger_index` with composite actionIds, and tracked in `step_instance` with parent references. Group completion is controlled by FHIR `selectionBehavior`.
 
-Additionally, this release adds `ORDER_VIOLATION` as a new deviation type (V3 migration) to detect steps completed out of sequence.
+Additionally, this release includes core schema optimizations (V4 migration) for production workloads.
 
 ---
 
 ## Feature Summary
 
-### Intelligence Action Evaluation
-- Nested `PlanDefinition.action.action[]` intelligence actions extracted during protocol loading
-- Each intelligence action has a condition (JSONLogic/FHIRPath), `definitionCanonical`, severity, and intelligence destination extensions
-- `IntelligenceActionEvaluator` evaluates actions at two trigger points:
-  - **Deviation detection** — when a step transitions to OVERDUE or MISSED
-  - **Step completion** — when a step is completed (for actions like "notify on late completion")
-- Context variables available to conditions: `stepState`, `deviationType`, `daysOverdue`, `daysPastMissedDate`, `actionId`, `repeatIndex`, `completionStatus`, `completedAt`
-- Bounded PlanDefinition parse cache (`ConcurrentHashMap`) eliminates redundant FHIR parsing per protocol
+### Sub-Step Groups
+- `PlanDefinition.action.action[]` with `type = "sub-step"` creates child step instances within a group
+- Group steps have NO trigger (validated at load time — mutually exclusive with sub-steps)
+- Sub-step triggers indexed in `trigger_index` with composite actionId format: `"parentActionId/subStepId"`
+- `selectionBehavior` controls group completion: `all` (default), `any`, `exactly-one`, `at-most-one`, `one-or-more`, `all-or-none`
+- Progressive instantiation within groups: sub-steps with `relatedAction` pointing to siblings are created when the sibling completes
+- Sub-steps can have their own intelligence actions (nested fire-event)
+- `ComplianceEngine.processSubStepMatch()` handles composite actionId routing through the engine
+- Tier 2 condition evaluation extended for sub-step triggers
+- Duplicate creation guard in progressive sub-step instantiation
 
-### Action Definitions (FHIR ActivityDefinition)
-- CRUD operations for `ActivityDefinition` resources stored as `ActionDefinition` entities
-- Canonical URL + version uniqueness enforced
-- Status lifecycle: ACTIVE → RETIRED
-- Referenced by intelligence actions via `definitionCanonical` (format: `url|version`)
-- Action types: `CommunicationRequest`, `Task`, `ServiceRequest` (from FHIR `ActivityDefinition.kind`)
-- Severity levels: LOW, MEDIUM, HIGH, CRITICAL
-- Intelligence destination: free-form routing identifier (e.g., `openMRS`, `SPICE`, `E-Buzima`)
+### PlanDefinition Parser Enhancements
+- `classifyNestedActions()` — routes nested actions to either `SubStepActionInfo` or `IntelligenceActionInfo`
+- Classification by explicit `type.coding[0].code` with backward-compatible fallback heuristics
+- `ActionMetadata` record extended with `groupingBehavior`, `selectionBehavior`, `subSteps` fields
+- New `SubStepActionInfo` record: id, title, triggers, relatedActions, timing, toleranceDays, requiredBehavior, intelligenceActions
+- Validation: rejects actions with both triggers AND sub-steps
 
-### Intelligence Event Logging
-- `IntelligenceEventLog` entity records each intelligence action execution in a single flat row
-- Stores the complete Kafka event payload (`event_payload` JSONB), evaluation context, trigger reason, and publish status
-- `published` boolean tracks whether the event was successfully sent to Kafka
-- No FK constraints — plain UUID columns for full decoupling from core compliance tables
+### Step Instance Lifecycle
+- `StepInstance` entity: new `parent_step_id` (UUID FK) and `parent_action_id` (VARCHAR) columns
+- `StepInstanceService.createSubSteps()` — creates entry-point sub-steps for a newly instantiated group
+- `StepInstanceService.createDependentSubSteps()` — progressive sibling instantiation via `relatedAction`
+- `StepInstanceService.evaluateGroupCompletion()` — auto-completes parent when `selectionBehavior` is satisfied
+- On parent auto-completion: top-level progressive instantiation, deviation detection, and protocol completion check run normally
 
-### Intelligence Trigger Publishing
-- `IntelligenceTriggerProducer` publishes `IntelligenceTriggerEvent` to `cce.intelligence.triggers` topic
-- Kafka key: `protocolInstanceId` (partition locality for per-patient ordering)
-- Fire-and-forget model — publishing failures are logged but don't fail the main transaction
-- Event payload includes: protocolInstanceId, stepInstanceId, deviationId, deviationType, stepState, actionId, protocolCanonical
+### Core Schema Optimization (V4)
+- Performance indexes and constraints for production workloads
 
-### Order Violation Detection
-- New `ORDER_VIOLATION` deviation type (V3 migration)
-- Detects when protocol steps are completed out of defined sequence (`relatedAction` ordering)
+---
 
-### REST API Additions
-- **Action Definitions** — 6 endpoints at `/v1/compliance/action-definitions`:
-  - `POST /` — create from ActivityDefinition JSON
-  - `GET /` — list all (filter by status)
-  - `GET /{id}` — get by ID
-  - `PUT /{id}` — update definition
-  - `POST /{id}/retire` — retire
-  - `DELETE /{id}` — delete (fails if action runs reference it)
-- **Intelligence Events** — 2 endpoints at `/v1/compliance/intelligence-events`:
-  - `GET /` — list all (filter by protocolInstanceId, actionDefinitionId, published)
-  - `GET /{id}` — get by ID
+## Database Schema Changes
 
-### Observability
-- New Micrometer metrics: `cce.intelligence.actions.evaluated`, `cce.intelligence.actions.fired`, `cce.intelligence.publish.duration`, `cce.action.definitions.active` (gauge)
-- MDC `intelligenceEventId` context during intelligence event publishing
-- Structured log messages for intelligence pipeline steps
-
-### Performance
-- Bounded `ConcurrentHashMap` cache for parsed PlanDefinition objects in `IntelligenceActionEvaluator`
+5 Flyway migrations (2 new since v1.1.0):
+- `V4__core_schema_optimization.sql` — Performance indexes and constraints
+- `V5__add_sub_step_support.sql` — Adds `parent_step_id` (UUID FK → step_instance), `parent_action_id` (VARCHAR) to `step_instance` + index
 
 ---
 
@@ -82,6 +64,7 @@ Kafka ─→ InboundEventConsumer ─→ ComplianceEngine
                                     ├── Tier 2 Evaluation (ExpressionEvaluationService)
                                     ├── Enrollment (ProtocolInstanceService)
                                     ├── Step Management (StepInstanceService)
+                                    │   ├── Sub-Step Groups (createSubSteps, evaluateGroupCompletion)
                                     │   └── Intelligence Evaluation (IntelligenceActionEvaluator)
                                     ├── Deviation Detection (DeviationService)
                                     │   └── Intelligence Evaluation (IntelligenceActionEvaluator)
@@ -91,39 +74,27 @@ Kafka ─→ InboundEventConsumer ─→ ComplianceEngine
 
 ---
 
-## Database Schema Changes
+## Migration from v1.1.0
 
-3 Flyway migrations:
-- `V1__initial_schema.sql` — Initial 7 tables (protocol_definition, protocol_instance, step_instance, deviation, trigger_index, event_log, audit_log)
-- `V2__intelligence_tables.sql` — 2 new tables: `action_definition`, `intelligence_event_log` (9 total)
-- `V3__add_order_violation_deviation_type.sql` — Adds `ORDER_VIOLATION` to deviation_type CHECK constraint
-
-Total tables: 9
-
----
-
-## Migration from v1.0.0
-
-1. Apply Flyway V2 migration (automatic on startup)
+1. Apply Flyway V4 + V5 migrations (automatic on startup)
 2. No breaking changes to existing REST API endpoints
 3. No changes to existing Kafka message schemas
-4. New intelligence triggers will only fire for protocols with nested intelligence actions in their PlanDefinition
+4. Existing PlanDefinitions without sub-steps continue to work unchanged
+5. Sub-step functionality activates only for PlanDefinitions with nested `action.action[]` typed as `sub-step`
 
 ---
 
-## Known Limitations (v1.1.0)
+## Known Limitations (v1.2.0)
 
-- **Intelligence event delivery/routing:** This service publishes trigger events to `cce.intelligence.triggers` — actual delivery to Receiver Adaptors is handled by the CCE Intelligence Service
-- **No CQL support:** Only JSONLogic and FHIRPath expression languages are supported
-- **`cce.protocol.control` topic reserved:** Not implemented
-- **No multi-tenancy:** Single-tenant deployment assumed
-- **No authentication at service level:** Security handled by CCE API Gateway
+- **Sub-step scheduler transitions:** The Scheduler Service is not yet aware of sub-step parent relationships. Sub-step OVERDUE→MISSED transitions may trigger without evaluating group-level semantics. This will be addressed in a future release.
+- **No REST API for sub-step queries:** No dedicated endpoint to list sub-steps for a given parent step (use existing step list filtered by `parentStepId`).
+- All limitations from v1.1.0 still apply.
 
 ---
 
 ## Test Coverage
 
-- **351 unit tests** covering all services, controllers, mappers, and intelligence pipeline
+- **351 unit tests** covering all services including sub-step lifecycle
 - **39 integration tests** covering end-to-end workflows with EmbeddedKafka + H2
 - JaCoCo coverage reports via `./gradlew test jacocoTestReport`
 

@@ -5,6 +5,48 @@ All notable changes to the CCE Compliance Service will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-05
+
+### Added
+
+#### Sub-Step Groups
+- `PlanDefinition.action.action[]` with `type.coding[0].code = "sub-step"` creates child step instances within a parent group
+- `SubStepActionInfo` record: id, title, triggers, relatedActions, timing, toleranceDays, requiredBehavior, intelligenceActions
+- `PlanDefinitionParser.classifyNestedActions()` — routes nested actions to either sub-step or intelligence action builders
+- Sub-step trigger indexing with composite actionId format (`parentActionId/subStepId`) in `TriggerIndex`
+- `StepInstanceService.createSubSteps()` — creates entry-point sub-steps for a newly instantiated group
+- `StepInstanceService.createDependentSubSteps()` — progressive sibling instantiation via `relatedAction` scoped to group
+- `StepInstanceService.evaluateGroupCompletion()` — auto-completes parent when `selectionBehavior` is satisfied
+- `ComplianceEngine.processSubStepMatch()` — handles composite actionId routing through the engine
+- `ComplianceEngine.evaluateSubStepConditions()` — Tier 2 condition evaluation for sub-step triggers
+- Group completion via FHIR `selectionBehavior`: all, any, exactly-one, at-most-one, one-or-more, all-or-none
+- Duplicate creation guard in progressive sub-step instantiation
+- Validation: rejects PlanDefinition actions with both triggers AND sub-steps (mutually exclusive)
+- Flyway V5 migration: `parent_step_id` (UUID FK → step_instance), `parent_action_id` (VARCHAR) + index on `step_instance`
+
+#### Schema Optimization
+- Flyway V4 migration: Performance indexes and constraints for production workloads
+
+### Changed
+
+#### Parser & Metadata
+- `ActionMetadata` record extended with `groupingBehavior`, `selectionBehavior`, `subSteps` fields and `hasSubSteps()` method
+- `buildTriggerIndexEntries()` recurses into sub-step triggers for composite actionId construction
+- `validateTriggers()` enforces mutual exclusivity between action triggers and sub-steps
+
+#### Engine Flow
+- `ComplianceEngine.processMatch()` — detects composite actionId (contains "/") and routes to sub-step processing
+- `performTwoTierMatching()` — handles composite actionId for sub-step trigger condition evaluation
+- `StepInstanceService.completeStep()` — when `parentStepId != null`, triggers progressive sibling creation + group completion evaluation
+
+#### Bug Fixes
+- `isGroupComplete()` — `all-or-none` no longer returns true when 0 completions exist (requires all complete)
+- Dead code removal: unused `hasDependency` variable in `createDependentSubSteps()`
+- Performance: PlanDefinition parsed once in sub-step completion flow (was parsed twice)
+- Misleading V5 migration comment fixed (referenced columns never added)
+
+---
+
 ## [1.1.0] - 2026
 
 ### Added
