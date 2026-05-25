@@ -197,8 +197,49 @@ public class ComplianceEngine {
         for (MatchedAction match : tier1Matches) {
             var actions = getActionsForProtocol(match.protocolDefinitionId(), actionCache);
 
+            String actionId = match.actionId();
+
+            // Handle composite actionId for sub-steps ("parentActionId/subStepId")
+            if (actionId.contains("/")) {
+                String[] parts = actionId.split("/", 2);
+                String parentActionId = parts[0];
+                String subStepId = parts[1];
+
+                var parentMetadata = actions.stream()
+                        .filter(a -> parentActionId.equals(a.id()))
+                        .findFirst()
+                        .orElse(null);
+
+                if (parentMetadata == null || !parentMetadata.hasSubSteps()) {
+                    continue;
+                }
+
+                var subStepInfo = parentMetadata.subSteps().stream()
+                        .filter(s -> subStepId.equals(s.id()))
+                        .findFirst()
+                        .orElse(null);
+
+                if (subStepInfo == null) {
+                    continue;
+                }
+
+                // Check sub-step trigger conditions
+                boolean hasCondition = subStepInfo.triggers().stream()
+                        .anyMatch(t -> t.condition() != null);
+
+                if (!hasCondition) {
+                    finalMatches.add(match);
+                } else {
+                    boolean conditionMet = evaluateSubStepConditions(subStepInfo, eventData);
+                    if (conditionMet) {
+                        finalMatches.add(match);
+                    }
+                }
+                continue;
+            }
+
             var actionMetadata = actions.stream()
-                    .filter(a -> match.actionId().equals(a.id()))
+                    .filter(a -> actionId.equals(a.id()))
                     .findFirst()
                     .orElse(null);
 
@@ -251,6 +292,22 @@ public class ComplianceEngine {
         return false;
     }
 
+    private boolean evaluateSubStepConditions(PlanDefinitionParser.SubStepActionInfo subStepInfo,
+                                              JsonNode eventData) {
+        for (PlanDefinitionParser.TriggerInfo trigger : subStepInfo.triggers()) {
+            if (trigger.condition() != null) {
+                boolean result = expressionEvaluationService.evaluate(
+                        trigger.condition().language(),
+                        trigger.condition().expression(),
+                        eventData);
+                if (result) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     private void processMatch(MatchedAction match, CloudEventMessage event, EventLog eventLog,
                               Map<UUID, List<PlanDefinitionParser.ActionMetadata>> actionCache) {
         ProtocolDefinition protocolDef = protocolDefinitionService.findById(match.protocolDefinitionId());
@@ -260,16 +317,23 @@ public class ComplianceEngine {
         ProtocolInstance protocolInstance = protocolInstanceService.enrollPatient(
                 patientId, protocolDef, OffsetDateTime.now(ZoneOffset.UTC));
 
+        // Check if this is a sub-step match (composite actionId: "parentActionId/subStepId")
+        String actionId = match.actionId();
+        if (actionId.contains("/")) {
+            processSubStepMatch(actionId, protocolInstance, event, eventLog, actionCache);
+            return;
+        }
+
         // Link event_log to the matched protocol instance
         eventLog.setProtocolInstanceId(protocolInstance.getId());
         eventLog.setProtocolDefinitionId(protocolDef.getId());
-        eventLog.setActionId(match.actionId());
+        eventLog.setActionId(actionId);
 
         // Find or create an actionable step
         StepInstance step = stepInstanceService.findActionableStep(
-                protocolInstance.getId(), match.actionId());
+                protocolInstance.getId(), actionId);
         if (step == null) {
-            step = createInitialStep(protocolInstance, match.actionId(), actionCache);
+            step = createInitialStep(protocolInstance, actionId, actionCache);
         }
 
         // Complete the step
@@ -281,9 +345,94 @@ public class ComplianceEngine {
         auditService.audit("COMPLIANCE", "EVENT_MATCHED", "system",
                 "EventLog", eventLog.getId().toString(),
                 Map.of("protocolDefinitionId", match.protocolDefinitionId().toString(),
-                        "actionId", match.actionId(),
+                        "actionId", actionId,
                         "protocolInstanceId", protocolInstance.getId().toString(),
                         "patientId", patientId));
+    }
+
+    /**
+     * Process a sub-step trigger match. The composite actionId format is "parentActionId/subStepId".
+     * Ensures the parent step exists, then finds/creates and completes the sub-step.
+     */
+    private void processSubStepMatch(String compositeActionId, ProtocolInstance protocolInstance,
+                                     CloudEventMessage event, EventLog eventLog,
+                                     Map<UUID, List<PlanDefinitionParser.ActionMetadata>> actionCache) {
+        String[] parts = compositeActionId.split("/", 2);
+        String parentActionId = parts[0];
+        String subStepActionId = parts[1];
+
+        eventLog.setProtocolInstanceId(protocolInstance.getId());
+        eventLog.setProtocolDefinitionId(protocolInstance.getProtocolDefinition().getId());
+        eventLog.setActionId(compositeActionId);
+
+        // Find or create the parent step
+        StepInstance parentStep = stepInstanceService.findActionableStep(
+                protocolInstance.getId(), parentActionId);
+        if (parentStep == null) {
+            parentStep = createInitialStep(protocolInstance, parentActionId, actionCache);
+
+            // Create sub-steps for the newly created parent
+            UUID protocolDefId = protocolInstance.getProtocolDefinition().getId();
+            List<PlanDefinitionParser.ActionMetadata> actions = getActionsForProtocol(protocolDefId, actionCache);
+            PlanDefinitionParser.ActionMetadata parentMetadata = actions.stream()
+                    .filter(a -> parentActionId.equals(a.id()))
+                    .findFirst()
+                    .orElse(null);
+
+            if (parentMetadata != null && parentMetadata.hasSubSteps()) {
+                stepInstanceService.createSubSteps(parentStep, parentMetadata.subSteps());
+            }
+        }
+
+        // Find or create the sub-step instance
+        StepInstance subStep = stepInstanceService.findActionableStep(
+                protocolInstance.getId(), subStepActionId);
+        if (subStep == null) {
+            // Sub-step not yet created (e.g., it depends on a sibling via relatedAction)
+            // Create it now with the parent reference
+            UUID protocolDefId = protocolInstance.getProtocolDefinition().getId();
+            List<PlanDefinitionParser.ActionMetadata> actions = getActionsForProtocol(protocolDefId, actionCache);
+            PlanDefinitionParser.ActionMetadata parentMetadata = actions.stream()
+                    .filter(a -> parentActionId.equals(a.id()))
+                    .findFirst()
+                    .orElse(null);
+
+            PlanDefinitionParser.SubStepActionInfo subStepInfo = parentMetadata != null
+                    ? parentMetadata.subSteps().stream()
+                        .filter(s -> subStepActionId.equals(s.id()))
+                        .findFirst()
+                        .orElse(null)
+                    : null;
+
+            OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
+            OffsetDateTime overdueDate = null;
+            OffsetDateTime missedDate = null;
+            String requiredBehavior = subStepInfo != null ? subStepInfo.requiredBehavior() : null;
+
+            if (subStepInfo != null && subStepInfo.toleranceDays() != null) {
+                overdueDate = now.plusDays(subStepInfo.toleranceDays());
+                missedDate = overdueDate.plusDays(subStepInfo.toleranceDays());
+            }
+
+            subStep = stepInstanceService.createStep(protocolInstance, subStepActionId, 0,
+                    now, overdueDate, missedDate, requiredBehavior);
+            subStep.setParentStepId(parentStep.getId());
+            subStep.setParentActionId(parentActionId);
+        }
+
+        // Complete the sub-step
+        stepInstanceService.completeStep(subStep, eventLog.getId(), event.getSource());
+
+        // Evaluate intelligence actions for the sub-step
+        intelligenceActionEvaluator.evaluateOnCompletion(subStep, event.getData());
+
+        auditService.audit("COMPLIANCE", "SUB_STEP_MATCHED", "system",
+                "EventLog", eventLog.getId().toString(),
+                Map.of("protocolDefinitionId", protocolInstance.getProtocolDefinition().getId().toString(),
+                        "parentActionId", parentActionId,
+                        "subStepActionId", subStepActionId,
+                        "protocolInstanceId", protocolInstance.getId().toString(),
+                        "patientId", event.getSubject()));
     }
 
     private StepInstance createInitialStep(ProtocolInstance protocolInstance, String actionId,

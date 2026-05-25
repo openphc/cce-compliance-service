@@ -61,6 +61,12 @@ public class StepInstance {
     @Column(name = "required_behavior")
     private String requiredBehavior;
 
+    @Column(name = "parent_step_id")
+    private UUID parentStepId;
+
+    @Column(name = "parent_action_id")
+    private String parentActionId;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private OffsetDateTime createdAt;
 

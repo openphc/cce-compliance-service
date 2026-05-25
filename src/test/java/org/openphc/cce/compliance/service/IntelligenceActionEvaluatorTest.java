@@ -358,7 +358,7 @@ class IntelligenceActionEvaluatorTest {
             when(planDefinitionParser.parse(anyString())).thenReturn(mockPlanDef);
             when(planDefinitionParser.extractActions(mockPlanDef)).thenReturn(List.of(
                     new PlanDefinitionParser.ActionMetadata("other-action", "Other",
-                            List.of(), List.of(), null, null, null, List.of())));
+                            List.of(), List.of(), null, null, null, null, null, List.of(), List.of())));
 
             List<IntelligenceEventLog> result = evaluator.evaluateOnDeviation(step, deviation);
 
@@ -575,6 +575,6 @@ class IntelligenceActionEvaluatorTest {
         when(planDefinitionParser.parse(anyString())).thenReturn(mockPlanDef);
         when(planDefinitionParser.extractActions(mockPlanDef)).thenReturn(List.of(
                 new PlanDefinitionParser.ActionMetadata(step.getActionId(), "Test Action",
-                        List.of(), List.of(), null, null, null, actions)));
+                        List.of(), List.of(), null, null, null, null, null, actions, List.of())));
     }
 }
