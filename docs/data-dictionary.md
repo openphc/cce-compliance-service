@@ -2,7 +2,7 @@
 
 > **CCE Compliance Service** — Complete database schema reference  
 > **Database**: PostgreSQL 16 | **Schema**: `public` | **Migration**: Flyway  
-> **Last Updated**: 2026-07-17
+> **Last Updated**: 2026-07-18
 
 ---
 
@@ -13,17 +13,18 @@
 3. [protocol_definition](#3-protocol_definition)
 4. [protocol_instance](#4-protocol_instance)
 5. [step_instance](#5-step_instance)
-6. [deviation](#6-deviation)
-7. [trigger_index](#7-trigger_index)
-8. [compliance_event_log](#8-compliance_event_log)
-9. [audit_log](#9-audit_log)
-10. [action_definition](#10-action_definition)
-11. [intelligence_event_log](#11-intelligence_event_log)
-12. [facility](#12-facility)
-13. [State-Transition History Tables](#13-state-transition-history-tables)
-14. [Enumerated Value Reference](#14-enumerated-value-reference)
-15. [Relationships & Foreign Keys](#15-relationships--foreign-keys)
-16. [JSONB Column Schemas](#16-jsonb-column-schemas)
+6. [group_step_instance](#6-group_step_instance)
+7. [deviation](#7-deviation)
+8. [trigger_index](#8-trigger_index)
+9. [compliance_event_log](#9-compliance_event_log)
+10. [audit_log](#10-audit_log)
+11. [action_definition](#11-action_definition)
+12. [intelligence_event_log](#12-intelligence_event_log)
+13. [facility](#13-facility)
+14. [State-Transition History Tables](#14-state-transition-history-tables)
+15. [Enumerated Value Reference](#15-enumerated-value-reference)
+16. [Relationships & Foreign Keys](#16-relationships--foreign-keys)
+17. [JSONB Column Schemas](#17-jsonb-column-schemas)
 
 ---
 
@@ -34,6 +35,8 @@ erDiagram
     PROTOCOL_DEFINITION ||--o{ PROTOCOL_INSTANCE : "defines"
     PROTOCOL_DEFINITION ||--o{ TRIGGER_INDEX : "indexed by"
     PROTOCOL_INSTANCE ||--o{ STEP_INSTANCE : "contains"
+    PROTOCOL_INSTANCE ||--o{ GROUP_STEP_INSTANCE : "cycles"
+    GROUP_STEP_INSTANCE ||--o{ STEP_INSTANCE : "groups"
     PROTOCOL_INSTANCE ||--o{ DEVIATION : "has"
     STEP_INSTANCE ||--o{ DEVIATION : "causes"
     COMPLIANCE_EVENT_LOG ||--o| STEP_INSTANCE : "completes"
@@ -66,6 +69,7 @@ erDiagram
         uuid protocol_instance_id FK
         varchar action_id
         int repeat_index
+        uuid group_step_instance_id FK
         varchar state
         timestamptz due_date
         timestamptz overdue_date
@@ -75,6 +79,17 @@ erDiagram
         varchar completion_status
         uuid completed_by_event_id
         varchar required_behavior
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    GROUP_STEP_INSTANCE {
+        uuid id PK
+        uuid protocol_instance_id FK
+        varchar group_action_id
+        int cycle_index
+        timestamptz due_date
+        varchar status
         timestamptz created_at
         timestamptz updated_at
     }
@@ -176,15 +191,16 @@ erDiagram
 | 1 | `protocol_definition` | Stores FHIR R4 PlanDefinition resources (protocol templates) | Low (tens) |
 | 2 | `protocol_instance` | Patient enrollments in specific protocols | Medium (per-patient) |
 | 3 | `step_instance` | Individual action steps within a patient's protocol journey | Medium–High |
-| 4 | `deviation` | Compliance deviations (overdue, missed) | Medium |
-| 5 | `trigger_index` | Inverted index for fast Tier 1 structural event matching | Low (rebuilt on protocol load) |
-| 6 | `compliance_event_log` | Lean idempotency log of all inbound CloudEvents and their processing outcomes | High (every event) |
-| 7 | `audit_log` | System and user audit trail | Medium–High |
-| 8 | `action_definition` | FHIR ActivityDefinition resources for intelligence actions | Low (tens) |
-| 9 | `intelligence_event_log` | Intelligence action execution and evaluation context (flat, no FKs) | Medium–High |
-| 10 | `facility` | Reference lookup table of known facilities — auto-populated from inbound event payloads | Low (one row per facility) |
-| 11 | `protocol_instance_history` | Append-only log of every `protocol_instance.status` transition (point-in-time, CDC → ClickHouse) | High (per status change) |
-| 12 | `step_instance_history` | Append-only log of every `step_instance.state`/`completion_status` transition (point-in-time, CDC → ClickHouse) | High (per state change) |
+| 4 | `group_step_instance` | One row per cycle of a repeating PlanDefinition action group | Medium (per group cycle) |
+| 5 | `deviation` | Compliance deviations (overdue, missed) | Medium |
+| 6 | `trigger_index` | Inverted index for fast Tier 1 structural event matching | Low (rebuilt on protocol load) |
+| 7 | `compliance_event_log` | Lean idempotency log of all inbound CloudEvents and their processing outcomes | High (every event) |
+| 8 | `audit_log` | System and user audit trail | Medium–High |
+| 9 | `action_definition` | FHIR ActivityDefinition resources for intelligence actions | Low (tens) |
+| 10 | `intelligence_event_log` | Intelligence action execution and evaluation context (flat, no FKs) | Medium–High |
+| 11 | `facility` | Reference lookup table of known facilities — auto-populated from inbound event payloads | Low (one row per facility) |
+| 12 | `protocol_instance_history` | Append-only log of every `protocol_instance.status` transition (point-in-time, CDC → ClickHouse) | High (per status change) |
+| 13 | `step_instance_history` | Append-only log of every `step_instance.state`/`completion_status` transition (point-in-time, CDC → ClickHouse) | High (per state change) |
 ---
 
 ## 3. protocol_definition
@@ -249,7 +265,7 @@ Represents a **patient's enrollment** in a specific compliance protocol. Created
 
 ## 5. step_instance
 
-Tracks an **individual action occurrence** within a patient's protocol journey. Each step corresponds to a single `action` from the protocol definition (including nested actions that are flattened at parse time). Steps follow a state machine lifecycle: `PENDING → DUE → OVERDUE → MISSED` (scheduler-driven, for `must` steps) or `→ SKIPPED` (scheduler-driven, for `could` steps) or `→ COMPLETED` (event-driven). Repeating steps are differentiated by `repeat_index`. Nested sub-steps from FHIR `action.action[]` are flattened to peer-level steps connected via `relatedSteps` references — there is no parent-child column.
+Tracks an **individual action occurrence** within a patient's protocol journey. Each step corresponds to a single `action` from the protocol definition (including nested actions that are flattened at parse time). Steps follow a state machine lifecycle: `PENDING → DUE → OVERDUE → MISSED` (scheduler-driven, for `must` steps) or `→ SKIPPED` (scheduler-driven, for `could` steps) or `→ COMPLETED` (event-driven). Repeating steps are differentiated by `repeat_index`. Nested sub-steps from FHIR `action.action[]` are flattened to peer-level steps connected via `relatedSteps` references — there is no parent-child column. Children of a **repeating action group** additionally carry a `group_step_instance_id` FK to their cycle row — see [§6 group_step_instance](#6-group_step_instance).
 
 ### Columns
 
@@ -259,6 +275,7 @@ Tracks an **individual action occurrence** within a patient's protocol journey. 
 | `protocol_instance_id` | `UUID` | **NOT NULL** | — | Foreign key → `protocol_instance.id`. |
 | `action_id` | `VARCHAR` | **NOT NULL** | — | Protocol definition `action.id` this step instantiates (e.g., `anc-visit-1`). Must be unique within a PlanDefinition. |
 | `repeat_index` | `INTEGER` | **NOT NULL** | `0` | Zero-based occurrence counter for repeating actions. Non-repeating actions always have index 0. |
+| `group_step_instance_id` | `UUID` | Yes | — | Foreign key → `group_step_instance.id`. Set only for steps that are children of a repeating action group, linking them to their cycle row (see [§6 group_step_instance](#6-group_step_instance)). `NULL` for the vast majority of steps — every non-group step. Distinct from `repeat_index`: this identifies *which cycle of a group* the step belongs to, not *which repeat of a single action*. |
 | `state` | `VARCHAR` | **NOT NULL** | — | Current step state. See [StepState](#stepstate). |
 | `due_date` | `TIMESTAMPTZ` | Yes | — | Scheduled due date. Calculated from `relatedAction.offsetDuration`, anchored to the predecessor's `completed_at` (clinical occurrence time — see §4.2). `NULL` for event-triggered steps. |
 | `overdue_date` | `TIMESTAMPTZ` | Yes | — | Overdue threshold. Typically `due_date + tolerance_days`. |
@@ -277,12 +294,14 @@ Tracks an **individual action occurrence** within a patient's protocol journey. 
 |------|------|---------|
 | Primary Key | `step_instance_pkey` | `id` |
 | Foreign Key | `step_instance_protocol_instance_id_fkey` | `protocol_instance_id` → `protocol_instance(id)` |
+| Foreign Key | `step_instance_group_step_instance_id_fkey` | `group_step_instance_id` → `group_step_instance(id)` (added in `V8`) |
 | Check | — | `state IN ('PENDING', 'DUE', 'OVERDUE', 'MISSED', 'COMPLETED', 'SKIPPED')` |
 | Check | — | `completion_status IN ('ON_TIME', 'EARLY', 'LATE')` |
 | Check | — | `required_behavior IN ('must', 'could', 'must-unless-documented')` |
 | B-tree Index | `idx_step_instance_protocol` | `protocol_instance_id` — All steps within a protocol instance. |
 | Partial B-tree | `idx_step_instance_state` | `state WHERE state IN ('PENDING', 'DUE', 'OVERDUE')` — Active (non-terminal) steps. |
 | Partial B-tree | `idx_step_instance_due_date` | `due_date WHERE state IN ('PENDING', 'DUE', 'OVERDUE')` — Scheduler time-based transitions. |
+| Partial B-tree | `idx_step_instance_group` | `group_step_instance_id WHERE group_step_instance_id IS NOT NULL` — All child steps of a group cycle (added in `V8`; sparse, since most steps are not group members). |
 
 ### State Machine
 
@@ -313,7 +332,53 @@ Tracks an **individual action occurrence** within a patient's protocol journey. 
 
 ---
 
-## 6. deviation
+## 6. group_step_instance
+
+Tracks **one row per cycle** of a repeating PlanDefinition **action group** — a parent action with nested `action.action[]` children that carries its own `Timing.repeat` (e.g., "6 monthly ANC visits," where each monthly visit is itself a bundle of sub-steps — weight check, BP check, lab order — that must recur together as a unit). Created lazily by `StepInstanceService.resolveGroupStepInstance()` the first time a cycle's child steps are materialized, and looked up thereafter via the `(protocol_instance_id, group_action_id, cycle_index)` unique constraint so re-entrant resolution calls return the existing row instead of inserting a duplicate. Each cycle's `step_instance` children carry a `group_step_instance_id` FK back to this row (see [§5 step_instance](#5-step_instance)), so "give me every step in this cycle" is a plain join instead of re-deriving the grouping from the PlanDefinition parser. When all of a cycle's mandatory (`must`) child steps reach a terminal state, `StepInstanceService.checkAndAdvanceGroupCycles` marks the cycle `COMPLETED` and spawns the next cycle (if the group's `Timing.repeat` bounds allow it).
+
+### Columns
+
+| Column | Data Type | Nullable | Default | Description |
+|--------|-----------|----------|---------|-------------|
+| `id` | `UUID` | **NOT NULL** | — (app-generated) | Primary key. Time-ordered **UUID v7** assigned by the application (`UuidV7Generator`), same pattern as `protocol_instance`/`step_instance` — see [Scheduler watermark cursor](architecture-overview.md#11-scheduler-service-contract). |
+| `protocol_instance_id` | `UUID` | **NOT NULL** | — | Foreign key → `protocol_instance.id`. |
+| `group_action_id` | `VARCHAR` | **NOT NULL** | — | The PlanDefinition `action.id` of the repeating group's **root** (parent) action — not the `action_id` of any individual child step. |
+| `cycle_index` | `INTEGER` | **NOT NULL** | `0` | Zero-based cycle number: `0` is the group's first occurrence, `1` its second, etc. See "What is a cycle?" below. |
+| `due_date` | `TIMESTAMPTZ` | Yes | — | Scheduled due date for the cycle as a whole, derived from the group root's `Timing.repeat` anchor. `NULL` when the cycle has no group-level timing anchor yet. |
+| `status` | `VARCHAR` | **NOT NULL** | — | Cycle lifecycle status. See [GroupStepInstanceStatus](#groupstepinstancestatus). |
+| `created_at` | `TIMESTAMPTZ` | **NOT NULL** | `now()` | Record creation timestamp. |
+| `updated_at` | `TIMESTAMPTZ` | **NOT NULL** | `now()` | Last modification timestamp (e.g., when `status` transitions to `COMPLETED`). |
+
+### Constraints & Indexes
+
+| Type | Name | Details |
+|------|------|---------|
+| Primary Key | `group_step_instance_pkey` | `id` |
+| Foreign Key | `group_step_instance_protocol_instance_id_fkey` | `protocol_instance_id` → `protocol_instance(id)` |
+| Check | — | `status IN ('ACTIVE', 'COMPLETED')` |
+| Unique | `group_step_instance_unique` | `(protocol_instance_id, group_action_id, cycle_index)` — Exactly one row per cycle per group per enrollment. This is the lookup/create key `resolveGroupStepInstance()` uses, making cycle creation idempotent against re-entrant or concurrent resolution calls. |
+| B-tree Index | `idx_group_step_instance_protocol` | `protocol_instance_id` — All cycles within a protocol instance. |
+
+### What is a "cycle"?
+
+A repeating **action group** is a parent PlanDefinition action with nested `action.action[]` children and its own `Timing.repeat` on the parent — as opposed to a single leaf action repeating on its own (tracked instead by `step_instance.repeat_index`, no `group_step_instance` row involved). A **cycle** is one occurrence of the whole nested bundle: cycle `0` is the first monthly bundle of sub-steps, cycle `1` the second, and so on. `group_step_instance` holds one row per cycle so cycle-level status ("is this month's bundle done?") is queryable directly, without re-scanning every child `step_instance` and re-deriving group membership from the PlanDefinition JSON each time.
+
+**`repeat_index` vs. `cycle_index` — two distinct dimensions:**
+
+- `step_instance.repeat_index` — 0-based occurrence counter for a **single repeating action** with no nested children (e.g., a leaf action repeated 6 times on its own `Timing.repeat`).
+- `group_step_instance.cycle_index` — 0-based occurrence counter for a **repeating action group** (a parent action whose entire set of nested children recurs together as one unit).
+
+A given `step_instance` is never driven by both at once in a meaningful way: a step is either a standalone repeating action (`repeat_index` varies, `group_step_instance_id` is `NULL`) or a child of a repeating group (`group_step_instance_id` is set, identifying its cycle; `repeat_index` stays at its default `0`).
+
+### Design Notes
+
+- **Cycle-level state lives here, not on `step_instance`.** `group_step_instance.status` answers "is this cycle as a whole done?" with a single-row lookup keyed by `(protocol_instance_id, group_action_id, cycle_index)`, instead of aggregating every child `step_instance` row on each query. Per-step timing state (`due_date`, `overdue_date`, `missed_date`, `state`) stays exactly where it already lived, on `step_instance` — `group_step_instance` does not duplicate or replace it, it only adds a cycle-scoped rollup.
+- **Two distinct repetition dimensions, one column each.** `step_instance.repeat_index` (single-action recurrence) and `group_step_instance.cycle_index` (which cycle of a nested group) are orthogonal concepts that happen to both be "0-based repeat counters" — do not conflate them when reasoning about a step's position in a repeating structure. See "`repeat_index` vs. `cycle_index`" above.
+- **Created lazily, not up front.** Unlike `step_instance` rows for non-repeating actions (created eagerly at enrollment/progressive instantiation), `group_step_instance` rows are created on first materialization of a cycle's children via `resolveGroupStepInstance()`, and the next cycle is only spawned once the current cycle's mandatory children all resolve — there is no pre-materialized table of all future cycles.
+
+---
+
+## 7. deviation
 
 Records **compliance deviations** detected during protocol execution. Created when a step transitions to `OVERDUE` or `MISSED`, or when an order violation is detected on completion. When intelligence actions are configured on the step's PlanDefinition action, the `IntelligenceActionEvaluator` is invoked and the `intelligence_event_id` is populated with the published event's UUID.
 
@@ -346,7 +411,7 @@ A step has **at most one deviation per type** — enforced by the `deviation_ste
 
 ---
 
-## 7. trigger_index
+## 8. trigger_index
 
 An **inverted index** for fast **Tier 1 structural matching** of inbound CloudEvents to protocol definition actions. Built at protocol load time by decomposing each action's trigger `data[].codeFilter[]` entries into `(resourceType, path, codeSystem, codeValue)` rows. Rebuilt whenever a protocol is reloaded.
 
@@ -406,7 +471,7 @@ The `:codeTriples` parameter is a list of `path|system|code` strings extracted f
 
 ---
 
-## 8. compliance_event_log
+## 9. compliance_event_log
 
 **Lean idempotency log** of every inbound CloudEvent. Records the event source and processing outcome. Used for:
 - **Idempotency**: `(cloudevents_id, source)` uniqueness prevents duplicate processing.
@@ -443,7 +508,7 @@ The `:codeTriples` parameter is a list of `path|system|code` strings extracted f
 
 ---
 
-## 9. audit_log
+## 10. audit_log
 
 **Immutable audit trail** for all significant system operations. Records both system-generated events (step completions, protocol enrollments, deviations) and API-driven operations (protocol loads, retirements).
 
@@ -471,7 +536,7 @@ The `:codeTriples` parameter is a list of `path|system|code` strings extracted f
 
 ---
 
-## 10. action_definition
+## 11. action_definition
 
 Stores FHIR R4 **ActivityDefinition** resources that define what CCE does when an intelligence action fires. Referenced by PlanDefinition intelligence actions via `definitionCanonical`. Each action definition specifies the type of action (FHIR `ActivityDefinition.kind`: `CommunicationRequest`, `Task`, `ServiceRequest`) and the full ActivityDefinition JSON (including message templates and routing configuration). Severity and destination are required on the PlanDefinition intelligence action extensions and are never stored on this table.
 
@@ -507,7 +572,7 @@ The **canonical reference** is `canonical_url|version` (e.g., `ActivityDefinitio
 
 ---
 
-## 11. intelligence_event_log
+## 12. intelligence_event_log
 
 Records each execution of an **intelligence action** (`PlanDefinition.action.action`) in a single flat row. Created when an intelligence action's condition evaluates to `true` on deviation detection or step completion. Combines the action execution record and its evaluation context (trigger reason, expression, runtime variables) into one table — no foreign key constraints, just plain UUID columns for full decoupling. The `event_payload` JSONB column stores the complete `IntelligenceTriggerEvent` published to Kafka, and the `published` boolean tracks whether the event was successfully sent.
 
@@ -550,7 +615,7 @@ Records each execution of an **intelligence action** (`PlanDefinition.action.act
 - **Fat event pattern:** The `event_payload` JSONB column stores the complete Kafka event, making each row self-contained. Consumers of the REST API can see exactly what was published without joining other tables.
 - **`published` boolean:** A simple boolean tracks whether the event was successfully sent to Kafka.
 
-## 12. facility
+## 13. facility
 
 Reference lookup table of known facilities, auto-populated from inbound FHIR event payloads by the `InboundEventConsumer`. Acts as the authoritative facility registry within the compliance service and is CDC-synced to ClickHouse for analytics.
 
@@ -611,7 +676,7 @@ If the CloudEvent envelope already carries a `facilityid` extension attribute (s
 
 ---
 
-## 13. State-Transition History Tables
+## 14. State-Transition History Tables
 
 Append-only audit logs that record **every** transition of the two UPDATE-in-place lifecycle
 columns. They exist because `protocol_instance.status` and `step_instance.state` are overwritten
@@ -664,7 +729,7 @@ Indexes: **none beyond the PK** (same rationale as `protocol_instance_history`).
 
 ---
 
-## 14. Enumerated Value Reference
+## 15. Enumerated Value Reference
 
 ### ProtocolDefinitionStatus
 
@@ -692,6 +757,13 @@ Indexes: **none beyond the PK** (same rationale as `protocol_instance_history`).
 | `MISSED` | Missed cutoff exceeded. Deviation recorded. Only for `must` steps. | `OVERDUE` | *(terminal)* |
 | `COMPLETED` | Completed by a matching inbound event. | `PENDING`, `DUE`, `OVERDUE` | *(terminal)* |
 | `SKIPPED` | Optional step (`requiredBehavior=could`) auto-skipped by scheduler or when a subsequent step completes. | `PENDING`, `DUE`, `OVERDUE` | *(terminal)* |
+
+### GroupStepInstanceStatus
+
+| Value | Description |
+|-------|-------------|
+| `ACTIVE` | Cycle in progress — at least one mandatory (`must`) child step has not yet reached a terminal state. |
+| `COMPLETED` | All mandatory (`must`) child steps of the cycle have reached a terminal state (`COMPLETED`, `MISSED`, or `SKIPPED`). Set by `StepInstanceService.checkAndAdvanceGroupCycles`, which then spawns the next cycle if the group's `Timing.repeat` bounds allow it. |
 
 ### CompletionStatus
 
@@ -762,13 +834,15 @@ The `intelligence_destination` field on `intelligence_event_log` is a **free-for
 
 ---
 
-## 15. Relationships & Foreign Keys
+## 16. Relationships & Foreign Keys
 
 | Parent Table | Child Table | FK Column | Cascade | Description |
 |-------------|-------------|-----------|---------|-------------|
 | `protocol_definition` | `protocol_instance` | `protocol_definition_id` | No cascade | Deletion prevented if instances exist. |
 | `protocol_definition` | `trigger_index` | `protocol_definition_id` | Application-managed | Entries deleted when protocol retired or rebuilt. |
 | `protocol_instance` | `step_instance` | `protocol_instance_id` | JPA `CascadeType.ALL` | Steps fully managed by parent. |
+| `protocol_instance` | `group_step_instance` | `protocol_instance_id` | No cascade (repository-managed) | Cycle rows are created directly via `GroupStepInstanceRepository`, not through a JPA collection on `ProtocolInstance`. |
+| `group_step_instance` | `step_instance` | `group_step_instance_id` | No cascade (DB level) | Links a group cycle to its materialized child steps; nullable, set only for group members. |
 | `protocol_instance` | `deviation` | `protocol_instance_id` | JPA `CascadeType.ALL` | Deviations fully managed by parent. |
 | `step_instance` | `deviation` | `step_instance_id` | No cascade (DB level) | Reference only; not cascade-deleted. |
 | `compliance_event_log` | `step_instance` | `completed_by_event_id` | No cascade | Links completed step to triggering event. |
@@ -780,7 +854,7 @@ The `intelligence_destination` field on `intelligence_event_log` is a **free-for
 
 ---
 
-## 16. JSONB Column Schemas
+## 17. JSONB Column Schemas
 
 ### protocol_definition — `definition`
 

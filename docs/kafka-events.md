@@ -405,6 +405,8 @@ public void consume(SchedulerTriggerMessage trigger) {
 
 **Note:** Uses `spring.json.value.default.type` property override since inbound messages are not CloudEventMessage.
 
+**Downstream effects of `OVERDUE_TO_MISSED`:** Beyond raising a `MISSED` deviation, `applySchedulerTransition` parses the step's `PlanDefinition` and, if the step belongs to a repeating step group, checks whether that cycle can now be advanced — creating the next cycle's `step_instance` rows before the protocol-completion check runs. This is an internal side effect of processing the consumed message; it does not change the topic, message schema, or produce any new Kafka event.
+
 ## 7. Producer Implementations
 
 ### 7.1 IntelligenceTriggerProducer

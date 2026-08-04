@@ -117,7 +117,7 @@ sequenceDiagram
                     end
 
                     Engine->>StepInst: completeStep(step, eventLogId, source, occurredAt)
-                    Note over StepInst: Single call — internally sets completed_at (clinical time,<br/>clamped to now), detects order violations, runs progressive<br/>instantiation of mandatory dependents (see §9), auto-skips<br/>preceding optional (could) steps, backfills unrecorded<br/>mandatory predecessors as PENDING (see §9)
+                    Note over StepInst: Single call — internally sets completed_at (clinical time,<br/>clamped to now), detects order violations, runs progressive<br/>instantiation of mandatory dependents (see §9), auto-skips<br/>preceding optional (could) steps, backfills unrecorded<br/>mandatory predecessors as PENDING (see §9).<br/>Design (pending implementation): when the parsed steps contain<br/>a repeating group, also locks the protocol instance row and<br/>advances group cycles (see §9 "Repeating Group Cycle<br/>Advancement") before any future completion check.
                     StepInst->>DB: UPDATE step_instance SET state=COMPLETED
 
                     Engine->>Intel: evaluateOnCompletion(step, eventPayload)
@@ -216,7 +216,9 @@ sequenceDiagram
     participant Kafka as Apache Kafka
     participant Consumer as SchedulerTriggerConsumer
     participant StepSvc as StepInstanceService
+    participant Parser as PlanDefinitionParser
     participant DevSvc as DeviationService
+    participant ProtoInst as ProtocolInstanceService
     participant DB as PostgreSQL
 
     Scheduler->>Kafka: Publish SchedulerTriggerMessage
@@ -252,6 +254,17 @@ sequenceDiagram
                 DevSvc->>DB: INSERT INTO deviation (idempotent)
             end
         end
+
+        Note over StepSvc,Parser: Unlike the other branches, OVERDUE_TO_MISSED always parses the<br/>plan definition — needed to check whether this step belongs to a<br/>repeating group, since a MISSED "must" child (or SKIPPED "could"<br/>child) can finish out that group's current cycle
+        StepSvc->>Parser: parse(definition) → extractSteps(planDefinition)
+        Parser-->>StepSvc: List<StepMetadata>
+        alt hasRepeatingGroup(steps)
+            StepSvc->>DB: findByIdForUpdate(protocolInstanceId)<br/>(pessimistic write lock)
+            StepSvc->>StepSvc: checkAndAdvanceGroupCycles(protocolInstance, steps)<br/>(see §9 "Repeating Group Cycle Advancement")
+        end
+
+        Note over StepSvc,ProtoInst: MISSED and SKIPPED are both terminal, so completion is<br/>checked unconditionally here — even if the transition above<br/>was a no-op (redelivered trigger, step already terminal)
+        StepSvc->>ProtoInst: checkAndCompleteProtocol(protocolInstanceId)
     end
 
     Consumer->>Kafka: Acknowledge offset
@@ -278,7 +291,8 @@ flowchart TD
     I -->|"No active step"| K["Create new<br/>StepInstance"]
 
     K --> L["Calculate repeatIndex"]
-    L --> N["Create StepInstance — state = PENDING<br/>(createStep always starts PENDING; the<br/>PENDING → DUE transition is scheduler-driven, see §3)"]
+    L --> M["resolveGroupStepInstance(actionId, cycleIndex=0)<br/>find-or-create the GroupStepInstance if actionId is<br/>inside a repeating group; null otherwise"]
+    M --> N["Create StepInstance — state = PENDING<br/>(createStep always starts PENDING; the<br/>PENDING → DUE transition is scheduler-driven, see §3)<br/>attached to the resolved GroupStepInstance, if any"]
 
     J --> P["completeStep()"]
     N --> P
@@ -526,6 +540,11 @@ flowchart TD
     COMPLETE --> DEPS["createDependentSteps()<br/>(find steps with relatedStep pointing to this step id)"]
     DEPS --> CREATED["Create dependent steps (PENDING)"]
     CREATED --> BACKFILL["backfillMissingMandatorySteps()<br/>(see 'Unrecorded Mandatory Predecessor Backfill' below)"]
+    BACKFILL --> HASGROUP{"hasRepeatingGroup(steps)?<br/>(design, pending implementation)"}
+    HASGROUP -->|"Yes"| LOCK["Lock protocol instance row<br/>(findByIdForUpdate — pessimistic write)"]
+    LOCK --> ADVANCE["checkAndAdvanceGroupCycles()<br/>(see 'Repeating Group Cycle<br/>Advancement' below)"]
+    ADVANCE --> DONE["Return"]
+    HASGROUP -->|"No"| DONE
 ```
 
 ### Dependent Step Creation on Completion
@@ -536,15 +555,16 @@ When any step completes, `createDependentSteps()` finds all steps whose `related
 flowchart TD
     START["createDependentSteps(completedStep, allSteps)"] --> FIND["Find steps with relatedStep → the completed step's id"]
     FIND --> LOOP{"For each dependent step"}
-    LOOP --> DEDUP{"An instance for this step<br/>already exists?"}
+    LOOP --> DEDUP{"Step for this action already exists?<br/>(scoped to completedStep's own cycle if the target<br/>is in the SAME repeating group as completedStep,<br/>else anywhere in the instance)"}
     DEDUP -->|"Yes"| SKIP["Skip — avoid duplicate<br/>(already created reactively via its own<br/>trigger, or by a redelivered predecessor)"]
-    DEDUP -->|"No"| MUST{"target step's<br/>requiredBehavior == must?"}
+    DEDUP -->|"No"| MUST{"target action's<br/>requiredBehavior == must?"}
     MUST -->|"No (could / unspecified)"| SKIP2["Skip pre-creation — a dangling PENDING row could<br/>later go OVERDUE/MISSED even though its event never<br/>arrives; created on the fly if its own trigger fires"]
     MUST -->|"Yes"| CALC["Calculate due date from offset + relationship<br/>(after-end → completedAt [clinical time], after-start → dueDate)"]
-    CALC --> RECURRING{"TimingInfo.count > 1?"}
+    CALC --> GROUP["Resolve target's GroupStepInstance:<br/>same repeating group as completedStep → reuse<br/>completedStep's GroupStepInstance; otherwise<br/>resolveGroupStepInstance(target, cycle=0)<br/>— find-or-create, or null if not grouped"]
+    GROUP --> RECURRING{"TimingInfo.count > 1?"}
 
     RECURRING -->|"Yes"| MULTI["Create N recurring instances with staggered due dates"]
-    RECURRING -->|"No"| SINGLE["createStep(dependent, dueDate) — state=PENDING"]
+    RECURRING -->|"No"| SINGLE["createStep(dependent, dueDate,<br/>groupStepInstance) — state=PENDING"]
 
     MULTI --> NEXT["Continue to next"]
     SINGLE --> NEXT
@@ -574,3 +594,45 @@ flowchart TD
 > Steps still **ahead** in the chain are deliberately excluded — backfilling them would stamp them with this completion's time and flatten the schedule their own `relatedAction` offsets define. They are left to progressive instantiation.
 
 > **Protocol completion:** there is currently no code path that transitions a `ProtocolInstance` out of `ACTIVE`. `ProtocolInstanceService.checkAndCompleteProtocol` and its supporting `PlanDefinitionParser.computeExpectedMustSteps`/`computeMustGroupSteps` logic were removed pending finalized completion criteria — see [Architecture Overview §6.2](architecture-overview.md#62-protocol-instance).
+
+### Repeating Group Cycle Advancement (checkAndAdvanceGroupCycles) — design, pending implementation
+
+Called from both `completeStep()` and the `OVERDUE_TO_MISSED` scheduler transition (§3), but only when `hasRepeatingGroup(steps)` is true — a cheap structural check (no query) performed first so protocols without a repeating group pay nothing extra. When true, the caller acquires a pessimistic write lock on the protocol instance row (`findByIdForUpdate` — the first DB lock in this codebase) before calling this method, serializing the cycle-advance/completion decision against concurrent triggers landing on sibling steps of the same instance. Cycle 0 of a repeating group is seeded elsewhere — by `ComplianceEngine.createInitialStep` (reactive path) and `StepInstanceService.createDependentSteps` (progressive path), both via `resolveGroupStepInstance` (see §4 and "Dependent Step Creation on Completion" above) — this method only ever advances an existing cycle N to N+1. This is designed to run before any future completion check, once automatic completion (above) is reinstated.
+
+```mermaid
+flowchart TD
+    START["checkAndAdvanceGroupCycles(protocolInstance, steps)"] --> ROOTS["Find repeating-group roots in steps<br/>(isRepeatingGroupRoot)"]
+    ROOTS --> LOOP{"For each group root R"}
+
+    LOOP --> MUST["mustDescendantIds =<br/>computeMustDescendants(R)"]
+    MUST --> MUSTEMPTY{"mustDescendantIds<br/>empty?"}
+    MUSTEMPTY -->|"Yes"| NEXT
+    MUSTEMPTY -->|"No"| CURCYCLE["currentCycle = latest GroupStepInstance<br/>for (protocolInstance, R)<br/>(highest cycleIndex)"]
+
+    CURCYCLE --> CYCLEEXISTS{"currentCycle<br/>exists?"}
+    CYCLEEXISTS -->|"No"| NOCYCLE["Skip — group hasn't started;<br/>cycle 0 is seeded elsewhere via<br/>resolveGroupStepInstance"]
+    NOCYCLE --> NEXT
+
+    CYCLEEXISTS -->|"Yes"| LOADCHILDREN["Load currentCycle's child steps<br/>(findByGroupStepInstanceId)"]
+    LOADCHILDREN --> ALLTERMINAL{"Every mustDescendant present<br/>AND in a terminal state<br/>(COMPLETED/MISSED/SKIPPED)?"}
+    ALLTERMINAL -->|"No"| INPROGRESS["Skip — cycle still in progress,<br/>or a must child was never<br/>materialized this cycle"]
+    INPROGRESS --> NEXT
+
+    ALLTERMINAL -->|"Yes"| MARKDONE["Mark currentCycle<br/>status = COMPLETED (if not already)"]
+    MARKDONE --> BOUNDCOUNT{"timing.count set AND<br/>nextCycleIndex &gt;= count?"}
+    BOUNDCOUNT -->|"Yes"| STOPCOUNT["Stop advancing — reached<br/>bounded repeat count"]
+    STOPCOUNT --> NEXT
+
+    BOUNDCOUNT -->|"No"| ANCHOR["cycleAnchor = max(completedAt ?? missedDate)<br/>across current cycle's must descendants<br/>(fallback: now())"]
+    ANCHOR --> NEXTDUE["nextDueDate = cycleAnchor +<br/>timing.period (periodUnit)"]
+    NEXTDUE --> BOUNDEND{"timing.boundsEnd set AND<br/>nextDueDate after boundsEnd?"}
+    BOUNDEND -->|"Yes"| STOPEND["Stop advancing — reached<br/>bounds end"]
+    STOPEND --> NEXT
+
+    BOUNDEND -->|"No"| RESOLVE["resolveGroupStepInstance(R, nextCycleIndex,<br/>nextDueDate) — find-or-create the<br/>next cycle's GroupStepInstance"]
+    RESOLVE --> SPAWN["For each mustDescendantId not already<br/>present in the next cycle:<br/>createStep(repeatIndex=0,<br/>attached to next GroupStepInstance)"]
+    SPAWN --> NEXT
+
+    NEXT["Continue to next root"] --> LOOP
+    LOOP -->|"Done"| END["Return"]
+```
