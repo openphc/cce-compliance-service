@@ -3,10 +3,11 @@ plugins {
     id 'org.springframework.boot' version '3.4.2'
     id 'io.spring.dependency-management' version '1.1.7'
     id 'jacoco'
+    id 'org.sonarqube' version '6.3.1.5724'
 }
 
 group = 'org.openphc.cce'
-version = '0.1.0-SNAPSHOT'
+version = '2.0.0'
 
 java {
     toolchain {
@@ -24,34 +25,26 @@ repositories {
     mavenCentral()
 }
 
-ext {
-    johnzonVersion = '2.0.2'
-    hapiVersion = '7.6.0'
-}
-
 dependencies {
-    // Spring Boot starters
+    // Shared vocabulary, Kafka contracts and FHIR parsing/evaluation.
+    implementation 'org.openphc.cce:cce-common-util'
+
+    // Spring Boot starters.
+    // starter-web serves the intelligence-event read endpoint plus actuator's /actuator/health
+    // (container HEALTHCHECK and Kubernetes probes) and /actuator/prometheus.
     implementation 'org.springframework.boot:spring-boot-starter-web'
     implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
-    implementation 'org.springframework.boot:spring-boot-starter-validation'
     implementation 'org.springframework.boot:spring-boot-starter-actuator'
     implementation 'org.springframework.kafka:spring-kafka'
 
-    // Database
+    // Database. No Flyway: this service owns no tables and runs with flyway.enabled=false, so a
+    // migration dependency here would only invite it to start writing DDL it does not own.
     runtimeOnly 'org.postgresql:postgresql'
-    implementation 'org.flywaydb:flyway-core'
-    implementation 'org.flywaydb:flyway-database-postgresql'
 
-    // FHIR
-    implementation "ca.uhn.hapi.fhir:hapi-fhir-base:${hapiVersion}"
-    implementation "ca.uhn.hapi.fhir:hapi-fhir-structures-r4:${hapiVersion}"
-    implementation "ca.uhn.hapi.fhir:hapi-fhir-caching-caffeine:${hapiVersion}"
-    implementation 'org.fhir:ucum:1.0.8'
-
-    // Expression evaluation
-    implementation "org.apache.johnzon:johnzon-jsonlogic:${johnzonVersion}"
-    implementation "org.apache.johnzon:johnzon-core:${johnzonVersion}"
-    implementation 'jakarta.json:jakarta.json-api:2.1.3'
+    // No FHIR or JSONLogic declarations. This service parses no PlanDefinitions and evaluates no
+    // expressions of its own — it reaches FHIR only through cce-common-util's cache and evaluator, and
+    // that library brings hapi-fhir, johnzon, jakarta.json, hapi-fhir-caching-caffeine and org.fhir:ucum
+    // with it. Redeclaring them here would only be a second version to keep in step.
 
     // Observability
     implementation 'io.micrometer:micrometer-registry-prometheus'
@@ -65,6 +58,9 @@ dependencies {
     testImplementation 'org.springframework.kafka:spring-kafka-test'
     testCompileOnly 'org.projectlombok:lombok'
     testAnnotationProcessor 'org.projectlombok:lombok'
+
+    // Lets ApplicationContextTest start the whole context without a live PostgreSQL.
+    testRuntimeOnly 'com.h2database:h2'
 }
 
 tasks.named('test') {
@@ -77,4 +73,43 @@ jacocoTestReport {
         xml.required = true
         html.required = true
     }
+}
+
+// Enforced at 98%: the only uncovered code is the application's main() bootstrap, which is excluded
+// below. Raise nothing here without adding the tests first — the ratchet is the point.
+jacocoTestCoverageVerification {
+    dependsOn jacocoTestReport
+    violationRules {
+        rule {
+            // Spring Boot's entry point: covering it means starting the whole context, which the
+            // integration suite does far better than a unit test asserting main() ran.
+            excludes = ['org.openphc.cce.compliance.ComplianceServiceApplication']
+            limit {
+                counter = 'INSTRUCTION'
+                value = 'COVEREDRATIO'
+                minimum = 0.98
+            }
+        }
+    }
+}
+
+tasks.named('check') {
+    dependsOn tasks.named('jacocoTestCoverageVerification')
+}
+
+sonar {
+    properties {
+        property 'sonar.organization', 'openphc'
+        property 'sonar.projectKey', 'openphc_cce-compliance-service'
+        // The report jacocoTestReport already emits. Sonar reads coverage from this file rather
+        // than measuring anything itself, so the two can only agree.
+        property 'sonar.coverage.jacoco.xmlReportPaths',
+                 "${layout.buildDirectory.get()}/reports/jacoco/test/jacocoTestReport.xml"
+    }
+}
+
+// Without this, `gradlew sonar` on a clean checkout uploads with no coverage at all — the task does
+// not build the report it reads.
+tasks.named('sonar') {
+    dependsOn jacocoTestReport
 }

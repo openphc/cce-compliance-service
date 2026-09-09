@@ -1,0 +1,18 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:ctxsmoke;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+  flyway:
+    enabled: false
+
+cce:
+  sla:
+    # Stops the poller repeating during the test. It still runs once — a fixedDelay schedule's first
+    # execution is immediate — but against an empty table that fetches nothing, and poll() never lets a
+    # failure escape. The interval keeps H2 out of a SKIP LOCKED loop it cannot faithfully reproduce.
+    poll-interval-ms: 3600000

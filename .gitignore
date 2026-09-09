@@ -52,8 +52,9 @@ test-output/
 hs_err_pid*
 replay_pid*
 
-
-.github/
 artifacts/
-
+bin/
 target/
+
+.claude/
+.github/copilot-instructions.md

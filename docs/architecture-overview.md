@@ -1,466 +1,443 @@
-# Architecture & Design
+# Architecture & Design — Compliance Service
 
-## 1. System Context
+> The time plane: what happens because a deadline passed or was beaten — never because an event
+> arrived.
 
-The **CCE Compliance Service** is a core microservice within the **Clinical Compliance Engine (CCE)** platform. It tracks patient adherence to clinical protocols defined as FHIR R4 `PlanDefinition` resources — consuming clinical events, matching them against protocol steps, and detecting deviations. Intelligence trigger publishing to downstream analytics is reserved for a future phase (will be driven by PlanDefinition-level configuration).
+System-wide context — why the services are split, the shared schema, the SLA handoff contract — lives
+in the **cce-common-util** repository's
+[Architecture Overview](../../cce-common-util/docs/architecture-overview.md). This document covers
+only what is specific to this service.
 
-```mermaid
-graph TB
-    subgraph External Systems
-        INTEL["CCE Intelligence Service"]
-        EHR["CCE Collector Service"]
-        SCHEDULER["CCE Scheduler Service"]
-        GATEWAY["CCE API Gateway<br/>(Auth & Routing)"]
-    end
+---
 
-    subgraph CCE Compliance Service
-        API["REST API<br/>(Spring MVC)"]
-        ENGINE["Compliance Engine<br/>(Core Orchestrator)"]
-        KAFKA_C["Kafka Consumers"]
-        KAFKA_P["Kafka Producers"]
-        FHIR["FHIR Parser<br/>(FHIR R4 Libraries)"]
-        EXPR["Expression Evaluator<br/>(JSONLogic + FHIRPath)"]
-        DB[("PostgreSQL 16<br/>+ JSONB")]
-    end
+## Operational prerequisite — Event Replay
 
-    subgraph Message Broker
-        KAFKA["Apache Kafka"]
-    end
+**This service must not run while the Matcher Service still has an event backlog to process.** Stop it
+for the duration, and start it again only once that backlog is drained.
 
-    EHR -->|"Clinical Events"| KAFKA
-    SCHEDULER -->|"Timer Triggers"| KAFKA
-    KAFKA -->|"cce.events.inbound"| KAFKA_C
-    KAFKA -->|"cce.scheduler.triggers"| KAFKA_C
-    KAFKA_C --> ENGINE
-    ENGINE --> FHIR
-    ENGINE --> EXPR
-    ENGINE --> DB
-    ENGINE --> KAFKA_P
-    KAFKA_P -->|"cce.intelligence.triggers"| INTEL
-    API --> ENGINE
-    API --> DB
-    GATEWAY -->|"Authenticated Requests"| API
+**Event Replay** is the term for any such run: events re-published to `cce.events.inbound` after a fix,
+a historical backfill during migration, or a restart that leaves the Matcher Service far behind on its
+consumer group. Use that term when coordinating — it is what this constraint is called.
 
-    classDef service fill:#4A90D9,stroke:#2C5F8A,color:white
-    classDef external fill:#7B8D8E,stroke:#566573,color:white
-    classDef data fill:#27AE60,stroke:#1E8449,color:white
-    classDef broker fill:#E67E22,stroke:#D35400,color:white
+Running both at once costs nothing in throughput. What it produces is **wrong verdicts that cannot be
+withdrawn**.
 
-    class API,ENGINE,KAFKA_C,KAFKA_P,FHIR,EXPR service
-    class EHR,SCHEDULER,INTEL,GATEWAY external
-    class DB data
-    class KAFKA broker
-```
+### Why it matters
 
-**This service does NOT handle:** event collection/ingestion (CCE Collector Service), scheduling (CCE Scheduler Service), analytics, alerting (CCE Intelligence Service), or authentication/authorization (handled by the API Gateway).
+This service concludes that work has not happened by finding no completion on `step_instance`. That
+inference is only sound once every event that could have completed the step has been matched. While
+events sit unprocessed in Kafka, an absent completion does not mean the work was not done — it means
+the Matcher Service has not reached it yet.
 
-### 1.1 Scheduler Service Contract
+During an Event Replay the two do not merely race occasionally; they collide by default:
 
-The **CCE Scheduler Service** is a headless background service with no REST API. It drives time-based step state transitions by polling the Compliance Service's `step_instance` table and publishing trigger messages to Kafka. Communication between the two services is **exclusively via Kafka** — there are no direct service-to-service HTTP calls.
+1. **Deadlines are anchored to clinical time, not to now.** The Matcher Service computes a step's
+   `due_date` from the occurrence time of the event that triggered it, and writes `process_by` and
+   `next_attempt_at` from that. Replaying a month-old event therefore creates a transition row whose
+   deadline has *already passed* — so it is eligible on the very next poll, seconds later.
+2. This service fetches that row, finds `step_status` is not `COMPLETED`, and writes `OVERDUE` (or
+   `MISSED`) with a matching deviation — the first and fourth rows of the table in
+   [§4](#4-what-the-applier-does).
+3. The completing event is still in the backlog. When the Matcher Service reaches it, it sets
+   `completed_at` to that event's own clinical timestamp — which is often *earlier* than `process_by`,
+   meaning the work was in fact done on time.
+4. **Nothing corrects step 2**, and each reason is deliberate:
+   - `sla_status` writes are forward-only, and `MET` is written only over a null, so a step recorded
+     `OVERDUE` can never become `MET`.
+   - The on-time sweep considers only steps with `sla_status IS NULL`, so it never revisits this one.
+   - The deviation row already exists and is de-duplicated, so it is not reconsidered.
+   - The intelligence actions already fired and were published to `cce.intelligence.triggers`. **A
+     clinician has already been alerted.**
 
-```mermaid
-sequenceDiagram
-    participant DB as PostgreSQL<br/>(owned by Compliance Service)
-    participant Scheduler as CCE Scheduler Service
-    participant Kafka as Apache Kafka
-    participant Consumer as SchedulerTriggerConsumer<br/>(Compliance Service)
-    participant StepSvc as StepInstanceService
+That last point is what makes this a prerequisite rather than a preference. A wrong `sla_status` and a
+spurious deviation can in principle be repaired by a data fix; a delivered alert cannot be recalled.
 
-    loop Polling interval
-        Scheduler->>DB: Poll step_instance for due transitions
-        Note over Scheduler,DB: SELECT where state/date thresholds met<br/>Lease via scheduler_lease to prevent duplicates
-        DB-->>Scheduler: Steps needing transition
+### Why stopping is safe
 
-        loop For each step
-            Scheduler->>Kafka: Publish SchedulerTriggerMessage<br/>(stepInstanceId, transitionType, triggeredAt)
-        end
-    end
+Nothing is lost by holding this service off. That is not luck — it follows from the design:
 
-    Kafka->>Consumer: Deliver to cce.scheduler.triggers
-    Consumer->>StepSvc: applySchedulerTransition()
-    StepSvc->>DB: UPDATE step_instance state
-```
+- Transition rows are durable and are never cancelled, and `process_by` is immutable.
+- The judgement never consults the wall clock, so a row applied hours or days late reaches **exactly**
+  the verdict it would have reached on time. See [One gate](#one-gate-and-what-follows-from-it).
+- `ORDER BY process_by ASC` takes the oldest deadline first, and batches drain within a cycle rather
+  than one batch per interval, so a backlog accumulated during the replay clears in minutes.
 
-#### Polling Query
+The only cost of stopping is detection latency — nothing is judged while it is down. The cost of not
+stopping is a permanently wrong clinical record.
 
-The Scheduler Service identifies steps that need transitions using:
+The runbook — how to stop it, how to tell the Matcher Service is caught up, how to verify the drain,
+and what to do if the sequence was missed — is in the
+[Deployment Guide](deployment-guide.md#event-replay--sequencing-the-two-services).
 
-```sql
-SELECT s FROM StepInstance s WHERE
-  (s.state = 'PENDING' AND s.dueDate <= :now) OR
-  (s.state = 'DUE' AND s.overdueDate <= :now) OR
-  (s.state = 'OVERDUE' AND s.missedDate <= :now)
-ORDER BY COALESCE(s.dueDate, s.overdueDate, s.missedDate) ASC
-```
+## 1. Responsibility
 
-Each condition maps to a specific `transitionType`:
+Everything the schedule drives — and the one verdict that needs no schedule at all:
 
-| Condition | Transition Type | Effect on Compliance Service |
-|---|---|---|
-| `state = PENDING` AND `dueDate ≤ now` | `PENDING_TO_DUE` | Step becomes actionable |
-| `state = DUE` AND `overdueDate ≤ now` | `DUE_TO_OVERDUE` | Deviation recorded (`OVERDUE`) |
-| `state = OVERDUE` AND `missedDate ≤ now` | `OVERDUE_TO_MISSED` | `MISSED` (must) or `SKIPPED` (could) |
+1. Pick up the `step_sla_state_transition` rows the Matcher Service scheduled, once they fall due, and
+   judge whether each threshold was breached.
+2. Sweep `step_instance` for completed steps that beat their `due_date`, with no row involved.
+3. Write `step_instance.sla_status` — `OVERDUE` and `MISSED` from (1), `MET` from (2). This service is
+   its only writer.
+4. Record the resulting `OVERDUE` / `MISSED` deviations. On-time work breached nothing and records none.
+5. Evaluate the intelligence actions those deviations trigger, and publish them.
 
-#### Ownership & Coordination
+The split between (1) and (2) is the shape of the whole service. A breach is measured against a
+schedule, so a row has to come round for it. Timeliness is a statement about the step, answerable from
+its own `completed_at` and `due_date` as soon as the completion lands — no threshold need fall for
+`MET` to be known. §3 is how both are driven.
 
-| Aspect | Owner | Details |
-|---|---|---|
-| **`step_instance` table** | Compliance Service | Schema, writes, Flyway migrations |
-| **`scheduler_lease` table** | Scheduler Service | Prevents duplicate trigger publishing across Scheduler instances |
-| **Polling reads** | Scheduler Service | Read-only access to `step_instance` (state, dueDate, overdueDate, missedDate) |
-| **State writes** | Compliance Service | Only the Compliance Service updates `step_instance.state` — the Scheduler never writes to it |
-| **Kafka topic** | Shared | `cce.scheduler.triggers` — Scheduler produces, Compliance consumes |
+It also exposes a read API over `intelligence_event_log`.
 
-> **Key invariant:** The Scheduler Service is a **read-only observer** of `step_instance`. It detects when a time threshold is crossed and notifies the Compliance Service via Kafka. The Compliance Service is the sole authority for state transitions — this ensures all business rules (requiredBehavior, deviation recording, auto-skip) are enforced in one place.
+**What it does not do**: match inbound events, enrol patients, create or complete steps, or manage
+definitions. It has no Kafka consumer — nothing inbound reaches it. `ORDER_VIOLATION` deviations stay
+with the Matcher Service, which detects them at completion from the event itself.
 
-## 2. Technology Stack
+## 2. Owns no tables
 
-| Category | Technology | Version | Purpose |
-|---|---|---|---|
-| **Runtime** | Java | 21 LTS | Language runtime |
-| **Framework** | Spring Boot | 3.4.2 | Application framework |
-| **Persistence** | Spring Data JPA / Hibernate | 6.x | ORM and data access |
-| **Database** | PostgreSQL | 16 | JSONB, GIN indexes |
-| **Migration** | Flyway | 10.x | Schema version management |
-| **JSONB Mapping** | Hibernate 6 `@JdbcTypeCode(SqlTypes.JSON)` | 6.x | Native JPA ↔ PostgreSQL JSONB |
-| **Messaging** | Spring Kafka | 3.x | Event-driven messaging |
-| **FHIR** | FHIR Libraries | 4.0.1 | FHIR R4 PlanDefinition parsing & validation |
-| **Expression** | Apache Johnzon JsonLogic | 2.0.2 | Tier 2 conditional evaluation (JSONLogic) |
-| **Metrics** | Micrometer + Prometheus | 1.x | Application metrics |
-| **Tracing** | OpenTelemetry | 1.x | Distributed tracing |
-| **Testing** | JUnit 5 + Mockito | 5.x / 5.x | Unit testing with mocked dependencies |
+This service creates nothing. Flyway is **disabled**; `ddl-auto` is `validate`.
 
-## 3. Package Structure
+Enabling Flyway here would add an empty ledger and invite a second service to write DDL for tables it
+does not own. Instead the service validates its JPA mapping against the schema at startup and fails
+fast if what it needs is absent — which is also how a deployment-order mistake surfaces immediately
+rather than as a runtime error hours later.
 
-```
-org.openphc.cce.compliance
-├── ComplianceServiceApplication.java          # @SpringBootApplication entry point
-├── config/                                    # AppConfig, ObservabilityConfig
-├── domain/
-│   ├── entity/                                # 7 JPA entities
-│   ├── enums/                                 # 6 value-based enums
-│   └── repository/                            # 7 Spring Data JPA repositories
-├── fhir/                                      # FHIR parsing, JSONLogic & FHIRPath evaluation
-├── kafka/
-│   ├── config/                                # Consumer/Producer factories, topic bindings
-│   ├── consumer/                              # InboundEventConsumer, SchedulerTriggerConsumer
-│   ├── model/                                 # CloudEventMessage, IntelligenceTriggerEvent
-│   └── producer/                              # (reserved for future phase)
-├── service/                                   # 9 business logic services + 3 supporting records
-└── web/                                       # Controllers, DTOs, DtoMapper, ExceptionHandler
-```
+Deploy **last**. Table ownership and the full ordering rationale:
+[Data Dictionary §3](../../cce-common-util/docs/data-dictionary.md#3-ownership).
 
-## 4. Core Pipeline — ComplianceEngine
+## 3. The fetch-and-apply cycle
 
-The `ComplianceEngine` is the central orchestrator. All inbound event processing flows through it:
+Every cycle runs **two independent sweeps**. The first fetches a batch of
+`step_sla_state_transition` rows whose deadline has passed and applies them; that is where a breach is
+detected. The second sweeps `step_instance` for steps that beat their due date and records them as
+`MET`.
+
+They are separate because they answer different questions from different evidence. A breach is a
+schedule's business — it happens at a deadline, so a row has to come round. Whether work was recorded
+*on time* needs no schedule at all: `completed_at` against `due_date`, both on the step. The second
+sweep therefore runs whether or not the first found anything, and a failure in one does not stop the
+other.
+
+Read them as **two sweeps, not two stages**. They query different tables, neither uses the other's
+results, and they run one after the other only because a single thread drives both. The order carries no
+more meaning than "a breach is the more pressing news".
 
 ```mermaid
 flowchart TD
-    START["CloudEventMessage received"] --> S1
-
-    S1["Step 1: Idempotency Check<br/>(cloudeventsId, source)"]
-    S1 -->|"Duplicate"| DUP["Return early"]
-    S1 -->|"New"| S2
-
-    S2["Step 2: Record Event Log"] --> S3
-    S3["Step 3: Extract Resource Info<br/>from payload (data)"] --> EXPL
-
-    EXPL{"Step 4: Explicit Match?<br/>(actionId on CloudEvent)"}
-    EXPL -->|"Yes"| EXPLM["processExplicitMatch()<br/>Bypass matching"]
-    EXPL -->|"No"| S5
-    EXPLM --> DONE["Return"]
-
-    S5["Step 5: Two-Tier Matching<br/>(see §5.4 for detailed flow)"] --> S6
-
-    S6{"Result Classification"}
-    S6 -->|"≥1 matches"| MATCH["For each match:<br/>Enroll patient (if needed) → Create step instance<br/>→ Progressive step instantiation"]
-    S6 -->|"0 matches"| ZERO["Log ZERO_MATCH"]
+    S["Scheduled poll<br/>every cce.sla.poll-interval-ms"]
+      --> D["FetchDueTransitions(now, batchSize)<br/>rows whose deadline has passed"]
+    D --> E{"any rows fetched?"}
+    E -->|"none"| Z["sweep ends — one empty query"]
+    E -->|"some"| A["apply each row<br/>same transaction as the fetch"]
+    A --> F{"batch full?"}
+    F -->|"yes"| D
+    F -->|"short"| Z
+    A -.->|"transaction rolled back"| B["backOff(ids)<br/>REQUIRES_NEW"]
 ```
 
-### 4.1 Resource Extraction
-
-Resource metadata is extracted from the CloudEvent **payload** (`data`), never from the envelope:
-
-| Field | Extraction Paths |
-|---|---|
-| `resourceType` | `data.resourceType` (e.g., `"Observation"`, `"Encounter"`) |
-| `allCodes` | `data.code.coding[*]`, `data.type.coding[*]`, `data.category[*].coding[*]`, `data.clinicalStatus.coding[*]`, `data.status` |
-
-## 5. Two-Tier Matching Algorithm
-
-### 5.1 Tier 1 — Structural Match
-
-Inverted index lookup on the `trigger_index` table using `GROUP BY` + `HAVING` to enforce **AND semantics** across all `codeFilter` entries:
-
-```sql
-SELECT protocol_definition_id, action_id
-FROM trigger_index
-WHERE resource_type = :resourceType
-  AND CONCAT(path, '|', code_system, '|', code_value) IN (:codeTriples)
-GROUP BY protocol_definition_id, action_id
-HAVING COUNT(DISTINCT path) = (
-    SELECT COUNT(DISTINCT t2.path)
-    FROM trigger_index t2
-    WHERE t2.protocol_definition_id = trigger_index.protocol_definition_id
-      AND t2.action_id = trigger_index.action_id
-      AND t2.resource_type = trigger_index.resource_type
-);
-```
-
-The `:codeTriples` parameter is a list of `path|system|code` strings extracted from the inbound event payload. The correlated subquery counts the **total** distinct paths each action requires, ensuring actions with different numbers of codeFilters are correctly evaluated in a single query.
-
-The index is built at protocol load time by decomposing each action's `TriggerDefinition.data[].codeFilter[]` into `(resourceType, path, codeSystem, codeValue, protocolDefinitionId, actionId)` rows.
-
-### 5.2 Condition-Only Triggers
-
-Triggers that have no `data[]` section (only a `condition`) are **not indexed** in `trigger_index`. They are held in-memory and evaluated via Tier 2 for every inbound event. These are validated at protocol load time — a trigger with no `data[]` and no `condition` is rejected.
-
-### 5.3 Tier 2 — Condition Evaluation
-
-For each Tier 1 candidate, evaluates the trigger's `condition` expression.  **Triggers with no `condition` pass automatically**.
-
-| Variable | Source |
-|---|---|
-| `event` | CloudEvent data payload |
-| `patient` | Patient context (`patientId`, demographics) |
-| `step` | Current step context (`actionId`, `repeatIndex`, `state`) |
-| `protocol` | Protocol context (`protocolCanonical`, `status`) |
-
-**Supported languages:**
-- `text/jsonlogic` — via Apache Johnzon `JsonLogic`
-- `text/fhirpath` — via FHIR `IFhirPath` engine (R4)
-- Any other — rejected with `UnsupportedExpressionLanguageException`
-
-### 5.4 How Matching Works — Step by Step
-
-> **Terminology:** In FHIR, `PlanDefinition.action[]` defines the steps of a protocol. In CCE, each `action` is a **step definition** — a template that becomes a `step_instance` when matched for a specific patient. Throughout this section, "step definition" and "action" are used interchangeably.
-
-A trigger definition has three filter components. Each component is **independent** — a trigger may use any combination:
-
-| Component | FHIR Path | What it checks |
-|---|---|---|
-| **F1** — Resource type | `trigger.data[].type` | Does the payload's `resourceType` match? (e.g., `Encounter`) |
-| **F2** — Code filters | `trigger.data[].codeFilter[]` | Do the payload's coded fields match the required `(path, system, code)` tuples? |
-| **F3** — Condition | `trigger.condition` | Does the payload satisfy a JSONLogic/FHIRPath expression? |
-
-> **F1 is implicit:** Every trigger that has a `data[]` section always has `data[].type` (the FHIR resource type). So F1 is present whenever F2 is present. A trigger with no `data[]` at all is a **condition-only trigger** (F3 only).
-
-#### Five Exclusive Matching Scenarios
-
-Every trigger in the system falls into **exactly one** of these five scenarios:
+Then the second sweep, over `step_instance` and nothing else:
 
 ```mermaid
 flowchart TD
-    EVENT["Inbound CloudEvent"] --> F1_CHECK{"F1: Does payload resourceType match any trigger data[].type?"}
-
-    F1_CHECK -->|"Yes"| HAS_F2{"Has F2? (codeFilter entries)"}
-    F1_CHECK -->|"No"| F3_ONLY{"F3-only triggers (condition-only, held in-memory)"}
-
-    HAS_F2 -->|"Yes"| TIER1["Tier 1 Query: GROUP BY + HAVING enforces ALL codeFilters match"]
-    HAS_F2 -->|"No"| HAS_F3_NOFILT{"Has F3? (condition)"}
-
-    HAS_F3_NOFILT -->|"No"| S1["Scenario 1 (F1) Match on resource type alone ⚠ Broadest match"]
-    HAS_F3_NOFILT -->|"Yes"| TIER2_F1F3["Tier 2: Evaluate condition against payload"]
-
-    TIER2_F1F3 -->|"true"| S3_ALT["Scenario 3 (F1,F3) Step created"]
-    TIER2_F1F3 -->|"false"| REJECT3["No match — eliminated"]
-
-    TIER1 --> TIER1_RESULT["Tier 1 Result Set (step definitions matching F1+F2)"]
-
-    TIER1_RESULT --> HAS_F3{"Has F3? (condition)"}
-    HAS_F3 -->|"No"| S2["Scenario 2 (F1,F2) Step created"]
-    HAS_F3 -->|"Yes"| TIER2["Tier 2: Evaluate condition against payload"]
-
-    TIER2 -->|"true"| S4["Scenario 4 (F1,F2,F3) Step created"]
-    TIER2 -->|"false"| REJECT["No match — eliminated"]
-
-    F3_ONLY --> EVAL_F3["Tier 2: Evaluate condition against payload"]
-    EVAL_F3 -->|"true"| S5["Scenario 5 (F3 only) Step created"]
-    EVAL_F3 -->|"false"| REJECT2["No match — eliminated"]
-
-    style S1 fill:#E67E22,stroke:#D35400,color:white
-    style S2 fill:#27AE60,stroke:#1E8449,color:white
-    style S3_ALT fill:#27AE60,stroke:#1E8449,color:white
-    style S4 fill:#27AE60,stroke:#1E8449,color:white
-    style S5 fill:#27AE60,stroke:#1E8449,color:white
-    style REJECT fill:#E74C3C,stroke:#C0392B,color:white
-    style REJECT2 fill:#E74C3C,stroke:#C0392B,color:white
-    style REJECT3 fill:#E74C3C,stroke:#C0392B,color:white
+    S2["same poll, after the sweep above<br/>runs whether or not that one found work"]
+      --> Q["FetchOnTimeSteps(batchSize)<br/>step_status = COMPLETED<br/>sla_status IS NULL<br/>completed_at &lt; due_date"]
+    Q --> E2{"any steps fetched?"}
+    E2 -->|"none"| Z2["sweep ends"]
+    E2 -->|"some"| W["write MET on each<br/>+ a step_instance_history row"]
+    W --> F2{"batch full?"}
+    F2 -->|"yes"| Q
+    F2 -->|"short"| Z2
 ```
 
-| Scenario | Components | Trigger Shape | Matching Path | Step Created When |
-|---|---|---|---|---|
-| **1** | **(F1)** | `data[].type` only — no `codeFilter[]`, no `condition` | Resource type match only | Payload `resourceType` matches trigger `data[].type`. **Broadest match** — every event of that type triggers a step. |
-| **2** | **(F1,F2)** | `data[].type` + `codeFilter[]`, no `condition` | Tier 1 (GROUP BY + HAVING) | All code filters match — **no further evaluation needed** |
-| **3** | **(F1,F3)** | `data[].type` + `condition`, no `codeFilter[]` | Resource type match → Tier 2 | `resourceType` matches AND condition evaluates to `true` |
-| **4** | **(F1,F2,F3)** | `data[].type` + `codeFilter[]` + `condition` | Tier 1 → **reuses Tier 1 result** → Tier 2 | All code filters match AND condition evaluates to `true` |
-| **5** | **(F3)** | `condition` only, no `data[]` | Tier 2 only (in-memory) | Condition evaluates to `true` (checked for **every** inbound event) |
+**No back-off path, and nothing to mark processed.** `sla_status IS NULL` is both the filter and the
+idempotency record: writing `MET` takes a step out of the set for good, and a batch that rolls back
+leaves it in, to be picked up next cycle. There is no per-row attempt count because there is no row —
+the step itself is the work item. That is the simplification driving off the step buys.
 
-> **Scenario 1 (F1) — caution:** A trigger with only `data[].type` and no `codeFilter[]` or `condition` will match **every** inbound event of that resource type (e.g., every `Encounter`). This is intentionally supported for use cases like "enroll patient on any encounter of this type," but protocol authors should be aware of the broad match scope.
+`MET` is written one step at a time rather than as a single `UPDATE`, because `step_instance_history`
+has to carry every `sla_status` transition and a set update would leave a gap exactly where a step went
+on time.
 
-#### Exclusivity
+The two fetches live on separate repositories — `SlaTransitionFetchRepository` and
+`OnTimeStepFetchRepository` — and both are kept out of cce-common-util's shared read side deliberately.
+Fetching rows to act on, and the pessimistic lock that comes with it, is this service's alone; the
+shared repositories are the read side another service could reach for.
 
-Each scenario is **mutually exclusive** — a trigger belongs to exactly one scenario based on which components it defines:
+### Step by step
 
-- Has `data[]` with `codeFilter[]` and `condition`? → **Scenario 4 (F1,F2,F3)**
-- Has `data[]` with `codeFilter[]` but no `condition`? → **Scenario 2 (F1,F2)**
-- Has `data[]` with only `type` (no `codeFilter[]`) and `condition`? → **Scenario 3 (F1,F3)**
-- Has `data[]` with only `type` (no `codeFilter[]`) and no `condition`? → **Scenario 1 (F1)**
-- Has only `condition` (no `data[]`)? → **Scenario 5 (F3)**
-- Has neither `data[]` nor `condition`? → **Rejected at protocol load time**
+**Scheduled poll** — a Spring `fixedDelay` timer, default 5s, is the only thing that starts work in this
+service. `poll()` catches everything `evaluateDue()` throws, because an exception escaping a
+`@Scheduled` method stops the schedule. Every replica runs its own timer.
 
-#### Tier 1 Result Reuse
+**`fetchDueTransitions(now, batchSize)`** — the only query that brings a transition row in. Fetches rows
+where `is_processed = false AND next_attempt_at <= now`, ordered by `process_by`, under
+`FOR UPDATE SKIP LOCKED` (a `PESSIMISTIC_WRITE` lock with the `-2` timeout hint Hibernate translates to
+`SKIP LOCKED`). The predicate selects on `next_attempt_at` rather than `process_by`: the two are equal
+when the Matcher Service writes the row, and a failure pushes `next_attempt_at` out so a retry is
+deferred without rewriting `process_by`, which stays the immutable record of when the deadline fell. The
+partial index `idx_sslt_due` covers exactly this predicate, so the scan touches only the unprocessed
+backlog.
 
-Scenarios 2 and 4 both require Tier 1 matching (F1+F2). The Tier 1 query is executed **once**, and its result set is **reused**:
+Note what it does *not* read: this is a single-table query with no join to `step_instance`, so it knows
+nothing about whether the step completed. Eligibility here is purely "this row's gate has passed"; what
+the row *means* is decided later, in the apply.
 
-1. The `trigger_index` query runs once, returning all `(protocolDefinitionId, actionId)` pairs where all code filters match.
-2. For **Scenario 2** step definitions (no condition): the Tier 1 result is final — step instances are created immediately.
-3. For **Scenario 4** step definitions (has condition): the same Tier 1 result is filtered through Tier 2 condition evaluation. There is **no re-query** of `trigger_index`.
+**any rows fetched?** — zero is the steady state: one empty indexed query per interval, and the cycle
+ends.
 
-```
-Tier 1 Result Set ──┬── step definitions without condition ──► Scenario 2 → create step instances
-                    │
-                    └── step definitions with condition ──► Tier 2 eval ──► Scenario 4 → create step instances (if true)
-```
+**apply each row** — per row: increment `attempts` (past five, the row is logged as an error every cycle
+rather than failing quietly), load the step, decide whether the threshold was breached, write
+`sla_status` forward-only, record the deviation if there is one, mirror the write into
+`step_instance_history`, and mark the row processed with `processed_by`. §4 covers the judgement itself.
+Each fetched id is also appended to a list the evaluator holds — plain memory rather than transactional
+state, so it survives a rollback and the failure path knows which rows to defer.
 
-#### Example Trigger (Scenario 4: F1,F2,F3)
+`next_attempt_at` appears nowhere in that judgement. It is a fetch gate and nothing else — outside the
+fetch predicate the only code that touches it is `backOff`, which writes it and never reads it. What
+the apply reads is `transition_type` and `process_by` from the row, both immutable, and `step_status`,
+`completed_at`, `sla_status` and `required_behavior` from the step. So *when* a row is applied cannot
+change what it decides.
 
-Consider a step definition (`action`) with a trigger that requires an `Encounter` (F1) with **four** code filters (F2) and a condition (F3):
+**batch full?** — a result that came back the full `cce.sla.batch-size` means there is probably more, so
+the loop fetches again within the same cycle; a short batch means the backlog is drained.
 
-```json
-"trigger": [
-  {
-    "type": "data-added",
-    "data": [
-      {
-        "type": "Encounter",
-        "codeFilter": [
-          {
-            "path": "type",
-            "code": [{ "system": "http://openphc.org/encounter-types", "code": "anc-visit" }]
-          },
-          {
-            "path": "status",
-            "code": [{ "code": "finished" }]
-          },
-          {
-            "path": "class",
-            "code": [{ "system": "http://terminology.hl7.org/CodeSystem/v3-ActCode", "code": "AMB" }]
-          },
-          {
-            "path": "serviceType",
-            "code": [{ "system": "http://openphc.org/service-types", "code": "high-risk-anc" }]
-          }
-        ]
-      }
-    ],
-    "condition": {
-      "language": "text/jsonlogic",
-      "expression": "{\"==\": [{\"var\": \"class.code\"}, \"AMB\"]}"
-    }
-  }
-]
-```
+**`backOff(ids)`** — the dashed edge, taken when `fetchAndApply` throws. The batch rolled back entirely,
+so nothing was marked processed and no deviation was written. The evaluator counts the failed batch,
+defers the ids it had fetched, and ends the cycle rather than starting another batch — whatever broke is
+likely to break the next one too. See [Retry](#retry) for the backoff itself.
 
-At **protocol load time**, this trigger is decomposed into 4 `trigger_index` rows (one per `codeFilter`):
+Three properties make this safe without any coordination machinery:
 
-| `resource_type` | `path` | `code_system` | `code_value` |
+**The row lock is what reserves the row.** `FOR UPDATE SKIP LOCKED` means a row locked by one replica is
+*invisible* to the others rather than contended, so every replica can poll the same table concurrently.
+There is no lease table, no heartbeat, and no leader election. A replica that dies mid-batch drops its
+connection, its locks release, and the work is immediately available again — no lease expiry to wait
+out.
+
+**Fetch and apply share one transaction.** Fetching in one transaction and applying in another would
+leave a window where a row is marked taken but not yet acted on, and a crash inside that window makes
+the state permanent. Here there is no such window: either the row is applied and committed, or the lock
+is released and nothing happened.
+
+**Batches drain within a cycle.** The evaluator keeps fetching until a batch comes back short, so a
+backlog that accumulated while the service was down clears in one cycle rather than one batch per
+interval. `MAX_BATCHES_PER_CYCLE` (100) stops a pathological backlog from monopolising the thread.
+
+`ORDER BY process_by ASC` means the oldest deadline is always handled first, so a backlog degrades by
+latency rather than by dropping the most overdue work.
+
+The on-time sweep has two steps of its own:
+
+**`fetchOnTimeSteps(batchSize)`** — a single-table read of `step_instance`, no join and no schedule
+consulted: `step_status = COMPLETED AND sla_status IS NULL AND completed_at < due_date`, with both
+timestamps required non-null, ordered by `completed_at` so the longest-waiting step is recorded first.
+It takes the same `FOR UPDATE SKIP LOCKED` as the transition fetch, so every replica can sweep the
+table at once and one that dies mid-batch releases its rows immediately.
+
+Each predicate is load-bearing. `COMPLETED`, because only recorded work can have been on time.
+`sla_status IS NULL`, because that is the whole of the sweep's bookkeeping — and because `MET` is
+written over a null and nothing else, so a step already judged is not this sweep's to relabel.
+`completed_at < due_date` strictly, because that comparison *is* the question, and work landing exactly
+on the deadline did not beat it. And `due_date IS NOT NULL`, which excludes a step created from its own
+trigger: it has no deadline to have beaten, so its `sla_status` stays null.
+
+The query reads the null half of `idx_step_instance_completed_unjudged`, whose partial predicate spans
+both unsettled statuses (`sla_status IS NULL OR sla_status = 'OVERDUE'`). Only the null half has a
+consumer, so the `OVERDUE` half is dead weight the shared schema could drop. Either way the scan covers
+the completed-but-unsettled set rather than every step ever created, and a step matches at most once —
+the `MET` it gets is what removes it from the set, and a sweep empties what has accumulated.
+
+Driving it the other way — scanning pending `DUE_DATE_REACHED` rows and checking each step — would mean
+walking the entire future schedule every few seconds to find the few steps that finished early.
+
+**write `MET` on each** — per step: `sla_status = MET` and the matching `step_instance_history` row,
+through the same forward-only `writeSlaStatus` every other write goes through. No deviation is
+recorded, so nothing here reaches the intelligence evaluation of §5 — there is nothing deviant about
+on-time work. A step that somehow arrives already settled has its write refused and is counted
+consumed rather than applied.
+
+The step's own pending `DUE_DATE_REACHED` row is left alone. It is fetched when its schedule comes
+round, finds the step settled, and is consumed then. It stays out of the backlog gauge in the meantime,
+because that gauge counts only rows whose `next_attempt_at` has passed.
+
+### One gate, and what follows from it
+
+A row becomes ready when `next_attempt_at` passes. That is the whole of it — there is no second way in,
+and nothing pulls a step's remaining rows forward because the step completed or was judged.
+
+So a settled step keeps its unspent schedule until those dates arrive. A step recorded `MET` by the
+on-time sweep, or `OVERDUE` by its own due-date row, still holds a pending `MISSED_DATE_REACHED` row; it
+is fetched when its date comes round, finds the threshold kept or the status already past it, records
+nothing, and is consumed. The row is disposed of late rather than early, and the step's `sla_status` is
+the same either way.
+
+**Why not fetch a settled step's rows early?** Because it would buy nothing and cost the retry
+contract. A row's verdict is a function of `process_by` and the step's own columns, so taking one ahead
+of its deadline produces exactly the outcome the deadline would have produced later — the write moves
+earlier, nothing else changes. And a query for such rows has to ask for `next_attempt_at > now`, which
+is precisely the state `backOff` puts a failed row into: it would re-fetch on the next cycle a row the
+back-off had just deferred, so the exponential interval would never take effect for the rows it covered.
+One gate, honoured, is both simpler and more correct.
+
+### Why a driver and an applier
+
+`SlaTransitionEvaluator` polls and loops; `SlaTransitionApplier` holds the `@Transactional`
+boundary. They are separate beans because `@Transactional` takes effect through the Spring proxy — a
+scheduled method calling a transactional method **on itself** bypasses the proxy entirely and runs
+with no transaction at all. Splitting them is what makes the annotation real.
+
+The evaluator's `poll()` never propagates: a failed cycle must not kill the scheduler thread.
+
+## 4. What the applier does
+
+This service is the **only writer of `step_instance.sla_status`**. The Matcher Service records that a
+step completed and when — it never judges whether that was timely — so there is no question here of
+overwriting what another service decided. A step's `sla_status` is null until a threshold falls due and
+this service judges it.
+
+The judgement compares `step_instance.completed_at`, the clinical occurrence time of the completing
+event, against the threshold the row stands for. The wall clock is not consulted: all that remains to
+ask is whether the work had happened by then.
+
+**A breach is all a transition row decides.** `OVERDUE` and `MISSED` are measured against its
+`process_by` — the schedule exists to detect a breach, and the row carries it.
+
+**`MET` is not decided here at all.** It is settled by the second sweep, from
+`step_instance.completed_at` against `step_instance.due_date`, with no row involved. So a due-date row
+whose threshold was kept records nothing: it is consumed, and the step's timeliness is the other
+sweep's to state.
+
+The two columns normally hold the same instant — the Matcher writes `due_date` and the
+`DUE_DATE_REACHED` row's `process_by` from one value in one transaction — but they are answering to
+different owners, and only `due_date` is a statement about the work.
+
+| Row | Step when applied | `sla_status` | Deviation |
 |---|---|---|---|
-| `Encounter` | `type` | `http://openphc.org/encounter-types` | `anc-visit` |
-| `Encounter` | `status` | *(empty)* | `finished` |
-| `Encounter` | `class` | `http://terminology.hl7.org/CodeSystem/v3-ActCode` | `AMB` |
-| `Encounter` | `serviceType` | `http://openphc.org/service-types` | `high-risk-anc` |
+| `DUE_DATE_REACHED` | not completed | `OVERDUE` | `OVERDUE` |
+| `DUE_DATE_REACHED` | `completed_at >= process_by` | `OVERDUE` | `OVERDUE` |
+| `DUE_DATE_REACHED` | `completed_at < process_by` | *unchanged* | — |
+| `MISSED_DATE_REACHED` | not completed | `MISSED` | `MISSED` |
+| `MISSED_DATE_REACHED` | `completed_at >= process_by` | `MISSED` | `MISSED` |
+| `MISSED_DATE_REACHED` | `completed_at < process_by` | *unchanged* | — |
 
-When an inbound `Encounter` event arrives:
+A step whose row no longer exists is consumed rather than retried: there is no schedule left to honour.
+A step marked `COMPLETED` with no `completed_at` is treated as a breach — the row is better evidence
+than a missing timestamp, and letting it pass would hide the gap instead of surfacing it. That rule
+needs no clock to justify it: a row is only ever applied once its own threshold has passed, so a step
+recorded complete with no timestamp is late by definition.
 
-1. **Tier 1 (F1+F2)** — The query matches on `resource_type = 'Encounter'` and checks the inbound event's `path|system|code` triples against all 4 indexed rows. The correlated `HAVING` clause compares the matched path count against this action's total path count (4). If the payload is missing any one (e.g., no `serviceType` code), this step definition is eliminated.
-2. **Tier 2 (F3)** — Since this step definition has a condition, the Tier 1 result is passed to Tier 2. The JSONLogic expression `{"==": [{"var": "class.code"}, "AMB"]}` is evaluated against the payload. Only if it returns `true` does this step definition produce a step instance.
+### Keeping a threshold is not the same as meeting an SLA
 
-> **Key point:** A step instance is created for **every** step definition that survives its matching scenario. If 3 different step definitions match a single inbound event (e.g., one via Scenario 1, one via Scenario 2, one via Scenario 4), 3 separate step instances are created.
+The two *unchanged* table rows are worth being careful about. A step completed between its thresholds
+breached neither the missed date nor — if it landed before `process_by` — the due-date row's schedule.
+Neither is a statement that it was on time.
 
-## 6. State Machines
+This is why no transition row writes `MET`. "Did not breach this threshold" and "met its SLA" are
+different claims, and a row that reported the first as the second would relabel a late completion as
+on time. Timeliness is asked of the step, once, by the on-time sweep: `completed_at < due_date`, or
+nothing.
 
-### 6.1 Step Instance
+A step with no `due_date` is therefore never recorded `MET`. It has no deadline to have beaten — a step
+created from its own trigger is the usual case — so its `sla_status` stays null, which is what null
+means.
 
-```mermaid
-stateDiagram-v2
-    [*] --> PENDING : createStep()
-    PENDING --> DUE : scheduler(PENDING_TO_DUE)
-    DUE --> OVERDUE : scheduler(DUE_TO_OVERDUE)
-    OVERDUE --> MISSED : scheduler(OVERDUE_TO_MISSED)
-    PENDING --> COMPLETED : completeStep()
-    DUE --> COMPLETED : completeStep()
-    OVERDUE --> COMPLETED : completeStep()
-    OVERDUE --> SKIPPED : scheduler(OVERDUE_TO_MISSED) [could]
-    COMPLETED --> [*]
-    MISSED --> [*]
-    SKIPPED --> [*]
-```
+Writes are **forward-only** for the same reason. `MET` and `MISSED` are settled outcomes, and `OVERDUE`
+must never replace `MISSED` — which is exactly what a retry applying a step's two rows out of order
+would otherwise do.
 
-**Completion status:** `EARLY` (before dueDate), `ON_TIME` (between due and overdue), `LATE` (after overdueDate or state was OVERDUE).
+### Optional steps
 
-**Required behavior:** Steps with `requiredBehavior=could` (from `PlanDefinition.action.requiredBehavior`) are optional. When the scheduler fires `OVERDUE_TO_MISSED` on a `could` step, it transitions to `SKIPPED` (no deviation) instead of `MISSED`. Additionally, when any step completes, preceding `could` steps still in actionable states are auto-skipped.
+A `MISSED` status and a `MISSED` deviation are both **`must`-only** — the rule the shared
+[Data Dictionary](../../cce-common-util/docs/data-dictionary.md#deviationtype) states. Nothing was
+required of an optional (`could`) step, so nothing was breached by its not happening.
 
-### 6.2 Protocol Instance
+The exemption applies on **both** the completed and the outstanding path, which is the part worth being
+deliberate about: an optional step recorded *after* its missed threshold gets no `MISSED` deviation
+either. Exempting only the step that never arrived would penalise doing optional work late more heavily
+than not doing it at all.
 
-`ACTIVE → COMPLETED | WITHDRAWN | EXPIRED`. Terminal states: `COMPLETED`, `WITHDRAWN`, `EXPIRED`.
+The exemption is `MISSED`-only. An optional step still takes an `OVERDUE` when it passes its due date:
+"running late" is a reportable fact about optional work, "breached" is not.
 
-Protocol completion is **automatic** — when all steps reach terminal states (`COMPLETED`, `MISSED`, `SKIPPED`), the protocol transitions to `COMPLETED`. There is no manual complete endpoint; `WITHDRAWN` covers manual termination.
+### What it does not write
 
-## 7. Security
+The applier **never writes `step_status`**. That column belongs to the Matcher Service — see
+[Architecture Overview §4](../../cce-common-util/docs/architecture-overview.md#4-step-status-and-sla-status).
 
-- **Authentication & Authorization:** Handled by the **CCE API Gateway**. This service does not implement security directly — all requests arrive pre-authenticated.
-- Actuator endpoints are publicly accessible for health checks and monitoring.
+Every `sla_status` write is mirrored into `step_instance_history` through the shared
+`StateTransitionHistoryWriter`, in the same transaction. Without it the time-driven half of a step's
+timeline would be missing from that table and from the CDC stream downstream of it: a step that went
+overdue and was never completed would show only its creation.
 
-See [API Reference](api-reference.md) for endpoint details.
+### Retry
 
-## 8. Observability
+A batch whose transaction rolled back is backed off rather than lost: `attempts` is incremented and
+`next_attempt_at` pushed out by `2^attempts` seconds, capped at `cce.sla.max-backoff-seconds`. The
+backoff write runs `REQUIRES_NEW`, because the transaction it is recovering from has already rolled
+back — joining it would roll the backoff back too, and the row would be retried immediately in a tight
+loop.
 
-### 8.1 Metrics
+Nothing re-fetches a deferred row ahead of its `next_attempt_at`, so the interval the backoff computes
+is the interval that actually elapses. A second fetch path that reached rows by their step's state would
+quietly undo that, because a deferred row is exactly a row whose `next_attempt_at` is in the future.
 
-| Metric | Type | Description |
+`processed_by` records which replica applied each row, so a misbehaving instance is identifiable from
+the data.
+
+## 5. Intelligence on deviation
+
+When a deviation is newly recorded — not when it already existed — the shared
+[`IntelligenceActionEvaluator`](../../cce-common-util/docs/library-reference.md#intelligence--intelligenceactionevaluator)
+evaluates the step's intelligence actions and publishes any that fire to
+`cce.intelligence.triggers`.
+
+The de-duplication matters: without it, a transition retried after a failure would re-trigger an alert
+a clinician has already received. `DeviationRecorder` reports whether the row was new, and the
+evaluation is gated on that.
+
+This service is **produce-only** on Kafka. Its `KafkaConfig` declares a producer factory, a template
+and the outbound topic — no consumer factory, no listener container, no DLQ, because nothing is
+consumed.
+
+## 6. Observability
+
+| Metric | Type | Meaning |
 |---|---|---|
-| `cce.events.processed` | Counter | Total inbound events processed |
-| `cce.events.matched` | Counter (tagged) | By status: `matched`, `zero_match` |
-| `cce.events.duplicate` | Counter | Duplicate events detected |
-| `cce.events.zero_match` | Counter | Events with zero trigger matches |
-| `cce.events.intelligence.published` | Counter | Intelligence trigger events published (future phase) |
-| `cce.step.matching.duration` | Timer | Tier 1 + Tier 2 matching time |
-| `cce.consumer.inbound.errors` | Counter | Inbound event consumer processing errors |
-| `cce.consumer.scheduler.errors` | Counter | Scheduler trigger consumer processing errors |
-| `cce.protocol.instances.active` | Gauge | Active protocol instances |
+| `cce.sla.transitions.due` | gauge | rows the next cycle would fetch: unprocessed, with `next_attempt_at` already passed — the primary health signal |
+| `cce.sla.steps.on-time-unsettled` | gauge | completed steps that beat their due date and have not been recorded `MET` yet — on-time work awaiting acknowledgement, not lateness |
+| `cce.sla.transitions.applied` | counter | `sla_status` writes that advanced a step — a transition row's breach, or the on-time sweep's `MET` |
+| `cce.sla.transitions.consumed` | counter | rows closed without recording a deviation — the event beat the deadline, the step was an exempt optional miss, or the SLA had already advanced |
+| `cce.sla.evaluator.cycles` | counter | polling cycles run |
+| `cce.sla.evaluator.batches.failed` | counter | batches that rolled back and were backed off |
 
-### 8.2 Logging & Tracing
+The gauge counts only what is **ready to process** — it carries `fetchDueTransitions`'s own predicate,
+so it reports what the next cycle will actually take. A gauge over every unprocessed row would fold in
+the entire future schedule, so it would track enrolment volume rather than lateness and could never sit
+near zero.
 
-- **Format:** `timestamp [thread] [correlationId] level logger - message`
-- **Tracing:** OpenTelemetry (OTLP), `correlationId` propagated via MDC and CloudEvents extensions
-- **Health:** `/actuator/health` (liveness + readiness), `/actuator/prometheus`
+The gauge is the one to alert on. It sits near zero in a steady state and rises when transitions fall
+due faster than they are applied — which is the failure this service can actually have. A sustained
+rise means the sweep is not keeping up; a rise with `batches.failed` climbing alongside means rows are
+failing and backing off rather than the sweep being slow.
 
-## 9. Error Handling
+`cycles` incrementing with everything else flat is the normal idle signature, and distinguishes "no
+work to do" from "scheduler stopped".
 
-### 9.1 REST API
+## 7. Scaling
 
-| Error Type | HTTP Status |
-|---|---|
-| Resource not found | 404 |
-| Invalid input | 400 |
-| State conflict | 409 |
-| FHIR validation failure | 422 |
-| Internal error | 500 |
+Scales with the **backlog**, not with inbound traffic — that is the reason it is a separate service.
+A burst of clinical events cannot delay the SLA sweep, and a large SLA backlog cannot delay event
+processing.
 
-### 9.2 Kafka
+Replicas are safe to add freely: the fetch-and-apply cycle needs no coordination, and adding an instance
+adds throughput directly. The limiting factor is database contention on
+`step_sla_state_transition`, not anything in the application.
 
-- **Consumer errors:** Exception propagates to `DefaultErrorHandler` → retries with 1-second fixed backoff (up to 3 attempts) → routes to DLQ topic (`<topic>.dlq`) after exhausting retries
-- **Dead Letter Queue:** Failed records are published to `cce.events.inbound.dlq` or `cce.scheduler.triggers.dlq` with original headers preserved
-- **Retry configuration:** `cce.kafka.retry.max-attempts` (default 3), `cce.kafka.retry.backoff-interval-ms` (default 1000)
-- **Producer:** Idempotent with `acks=all`
-- **Deserialization:** `ErrorHandlingDeserializer` wraps errors gracefully
+`cce.sla.batch-size` trades transaction length against round trips. A larger batch holds row locks
+longer, which matters only if the Matcher Service is inserting into the same table heavily at the same
+time.
 
-## 10. Scaling
+## 8. Security
 
-| Dimension | Strategy |
-|---|---|
-| **Horizontal** | Kafka consumer group enables multi-instance; partition assignment is automatic (25 partitions per topic) |
-| **Database** | Connection pool per instance (20 max) |
-| **Kafka** | 3 concurrent listener threads per instance; 25 partitions per topic (configurable via `cce.kafka.topics.default-partitions`) |
-| **API** | Stateless — any instance serves any request |
+No authentication at the application layer; the read API is expected to sit behind the gateway
+service. The service performs no writes on behalf of a caller — every write it makes is driven by the
+scheduler, from rows another service created.
