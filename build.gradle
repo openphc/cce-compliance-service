@@ -3,6 +3,7 @@ plugins {
     id 'org.springframework.boot' version '3.4.2'
     id 'io.spring.dependency-management' version '1.1.7'
     id 'jacoco'
+    id 'org.sonarqube' version '6.3.1.5724'
 }
 
 group = 'org.openphc.cce'
@@ -115,4 +116,17 @@ jacocoTestReport {
         xml.required = true
         html.required = true
     }
+}
+
+sonar {
+    properties {
+        property 'sonar.organization', 'openphc'
+        property 'sonar.projectKey', 'openphc_cce-compliance-service'
+        property 'sonar.coverage.jacoco.xmlReportPaths',
+                 "${layout.buildDirectory.get()}/reports/jacoco/test/jacocoTestReport.xml"
+    }
+}
+
+tasks.named('sonar') {
+    dependsOn jacocoTestReport
 }
