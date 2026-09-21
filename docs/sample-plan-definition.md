@@ -634,7 +634,7 @@ Each `definitionCanonical` referenced in the PlanDefinition must have a register
 | Feature | Field / Extension | Allowed Values |
 |---|---|---|
 | Action type coding (required on every action, all nesting levels) | `action[].type.coding` | `step` (`http://openphc.org/fhir/CodeSystem/action-type`) or `fire-event` (`http://terminology.hl7.org/CodeSystem/action-type`) |
-| Trigger — resource + code filter | `trigger[].data[].codeFilter[]` | One row per code in `TriggerIndex` |
+| Trigger — resource + code filter | `trigger[].data[].codeFilter[]` | One row per code in `TriggerIndex`. `codeFilter.path` may point at either a `CodeableConcept` (`Observation.code`, `Encounter.type`, ...) or a bare `Coding` (`Encounter.class`, ...) — both are extracted correctly; see `ResourceInfoExtractor` in `architecture-overview.md` §5.1. |
 | Trigger — inline condition | `trigger[].condition` | `text/fhirpath`, `text/jsonlogic` |
 | Trigger — condition only (no data) | `trigger[]` with no `data[]` | Placed in `extractConditionOnlyTriggers()` |
 | Intelligence sub-action condition | `action[].condition[kind=applicability]` | `text/fhirpath`, `text/jsonlogic` |

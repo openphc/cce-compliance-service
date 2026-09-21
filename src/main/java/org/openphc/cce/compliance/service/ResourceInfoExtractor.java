@@ -70,13 +70,14 @@ public class ResourceInfoExtractor {
     }
 
     /**
-     * Extract codings from a CodeableConcept field (single object with coding array).
+     * Extract codings from a field that is either a CodeableConcept or a bare Coding
+     * (single object with coding array).
      */
     private void extractCodingsFromPath(JsonNode data, String path, List<CodePathTriple> result) {
         JsonNode node = data.get(path);
         if (node == null) return;
         if (node.isObject()) {
-            extractCodingsFromCodeableConcept(path, node, result);
+            extractCodingsFromCodeableConceptOrCoding(path, node, result);
         }
     }
 
@@ -90,24 +91,35 @@ public class ResourceInfoExtractor {
         if (node.isArray()) {
             for (JsonNode item : node) {
                 if (item.isObject()) {
-                    extractCodingsFromCodeableConcept(path, item, result);
+                    extractCodingsFromCodeableConceptOrCoding(path, item, result);
                 }
             }
         } else if (node.isObject()) {
             // Fallback: some resources define this field as 0..1 CodeableConcept
-            extractCodingsFromCodeableConcept(path, node, result);
+            extractCodingsFromCodeableConceptOrCoding(path, node, result);
         }
     }
 
-    private void extractCodingsFromCodeableConcept(String path, JsonNode codeableConcept,
-                                                    List<CodePathTriple> result) {
-        JsonNode codingList = codeableConcept.get("coding");
+    /**
+     * A codeFilter path can resolve to either a CodeableConcept ({@code {"coding": [...], "text": ...}})
+     * or a bare Coding ({@code {"system": ..., "code": ..., "display": ...}} directly) — FHIR R4 defines
+     * DataRequirement.codeFilter against both, and both actually occur in practice (e.g. Encounter.class
+     * is a bare Coding, not a CodeableConcept, despite sitting alongside genuine CodeableConcept fields
+     * like Encounter.type). Handle both shapes here rather than assuming every codeFilter path is a
+     * CodeableConcept, so a bare-Coding field never silently extracts zero codings.
+     */
+    private void extractCodingsFromCodeableConceptOrCoding(String path, JsonNode codeableConceptOrCoding,
+                                                            List<CodePathTriple> result) {
+        JsonNode codingList = codeableConceptOrCoding.get("coding");
         if (codingList != null && codingList.isArray()) {
             for (JsonNode coding : codingList) {
                 if (coding.isObject()) {
                     addCodePathTriple(path, coding, result);
                 }
             }
+        } else if (codeableConceptOrCoding.has("code") || codeableConceptOrCoding.has("display")) {
+            // Bare Coding — the node itself IS the coding, not a wrapper around coding[].
+            addCodePathTriple(path, codeableConceptOrCoding, result);
         }
     }
 

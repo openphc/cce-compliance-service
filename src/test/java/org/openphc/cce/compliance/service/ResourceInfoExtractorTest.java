@@ -239,6 +239,51 @@ class ResourceInfoExtractorTest {
                         "http://terminology.hl7.org/CodeSystem/condition-clinical", "active"))));
     }
 
+    // ── extractCodes — bare Coding (e.g. Encounter.class, which is a Coding, not a CodeableConcept) ──
+
+    @Test
+    void extractCodes_fromBareCodingClass() {
+        JsonNode data = toJsonNode(Map.of(
+                "resourceType", "Encounter",
+                "class", Map.of(
+                        "system", "http://terminology.hl7.org/CodeSystem/v3-ActCode",
+                        "code", "AMB",
+                        "display", "ambulatory"
+                )
+        ));
+        List<CodePathTriple> codes = extractor.extractCodes(data);
+        assertTrue(codes.stream().anyMatch(c ->
+                c.equals(new CodePathTriple("class",
+                        "http://terminology.hl7.org/CodeSystem/v3-ActCode", "AMB"))));
+    }
+
+    @Test
+    void extractCodes_bareCodingWithoutCode_fallsBackToDisplay() {
+        JsonNode data = toJsonNode(Map.of(
+                "resourceType", "Encounter",
+                "class", Map.of(
+                        "system", "http://terminology.hl7.org/CodeSystem/v3-ActCode",
+                        "display", "TRANSFER_ENCOUNTER" // no "code" — falls back to display, same as a coding[] entry would
+                )
+        ));
+        List<CodePathTriple> codes = extractor.extractCodes(data);
+        assertTrue(codes.stream().anyMatch(c ->
+                c.equals(new CodePathTriple("class",
+                        "http://terminology.hl7.org/CodeSystem/v3-ActCode", "TRANSFER_ENCOUNTER"))));
+    }
+
+    @Test
+    void extractCodes_textOnlyCodeableConcept_stillYieldsNoCodesForThatPath() {
+        // {"text": "..."} has neither coding[] nor code/display directly — must not be
+        // mistaken for a bare Coding just because it lacks a coding[] array.
+        JsonNode data = toJsonNode(Map.of(
+                "resourceType", "Encounter",
+                "class", Map.of("text", "Ambulatory visit")
+        ));
+        List<CodePathTriple> codes = extractor.extractCodes(data);
+        assertTrue(codes.stream().noneMatch(c -> c.path().equals("class")));
+    }
+
     // ── extractCodes — plain string status ──
 
     @Test

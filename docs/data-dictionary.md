@@ -352,6 +352,8 @@ An **inverted index** for fast **Tier 1 structural matching** of inbound CloudEv
 
 Only triggers that contain a `data[]` section produce `trigger_index` entries. **Condition-only triggers** (no `data[]`, only `condition`) are held in-memory and evaluated via Tier 2 for every inbound event.
 
+`codeFilter.path` may resolve to either a `CodeableConcept` or a bare `Coding` on the actual FHIR resource — e.g. `Encounter.type` is a `CodeableConcept` but `Encounter.class` is a bare `Coding`, despite both being valid `codeFilter` paths per FHIR R4's `DataRequirement.codeFilter`. `ResourceInfoExtractor.extractCodes()` (the inbound-event counterpart to this index) handles both shapes when decomposing a payload into `(path, system, code)` triples for comparison against `trigger_index`.
+
 ### Columns
 
 | Column | Data Type | Nullable | Default | Description |

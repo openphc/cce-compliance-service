@@ -331,6 +331,8 @@ The `:codeTriples` parameter is a list of `path|system|code` strings extracted f
 
 The index is built at protocol load time by decomposing each action's `TriggerDefinition.data[].codeFilter[]` into `(resourceType, path, codeSystem, codeValue, protocolDefinitionId, actionId)` rows.
 
+On the inbound-event side, `ResourceInfoExtractor.extractCodes()` decomposes the payload into the same `(path, system, code)` triples so the two sides can be compared. A `codeFilter.path` can resolve to either a `CodeableConcept` (`{"coding": [...], "text": ...}`, e.g. `Observation.code`, `Encounter.type`) or a bare `Coding` (`{"system": ..., "code": ..., "display": ...}` directly, e.g. `Encounter.class`) — FHIR R4 defines `DataRequirement.codeFilter` against both, and both occur in real payloads. The extractor checks for a `coding[]` array first (CodeableConcept) and falls back to treating the node itself as a single coding when `coding[]` is absent but `code`/`display` is present directly on it (bare Coding) — a path is never assumed to be one shape or the other.
+
 ### 5.2 Condition-Only Triggers
 
 Triggers that have no `data[]` section (only a `condition`) are **not indexed** in `trigger_index`. They are held in-memory and evaluated via Tier 2 for every inbound event. These are validated at protocol load time — a trigger with no `data[]` and no `condition` is rejected.
