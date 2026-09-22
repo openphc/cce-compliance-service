@@ -235,23 +235,33 @@ public class StepInstanceService {
 
 
     /**
-     * Detect order violations: when a step completes, check if any immediate
-     * predecessor steps (with requiredBehavior="must") are still in
+     * Detect order violations: when a step completes, check if any of its own
+     * declared predecessors (with requiredBehavior="must") are still in
      * non-terminal incomplete states (PENDING, DUE, OVERDUE).
-     * A predecessor of step X is any step whose relatedSteps list contains X.
+     * A predecessor of step X is an action named in X's own relatedSteps list
+     * (X is declared to come after it) - not a step that names X as ITS
+     * predecessor, which would be a successor of X, not a predecessor.
      */
     private void detectOrderViolations(StepInstance completedStep,
                                        List<PlanDefinitionParser.StepMetadata> steps) {
         ProtocolInstance protocolInstance = completedStep.getProtocolInstance();
         String completedStepId = completedStep.getActionId();
 
-        // Find immediate predecessors: steps whose relatedSteps contain this step's id
-        // and that have requiredBehavior="must"
-        List<String> mustPredecessorIds = steps.stream()
-                .filter(s -> "must".equals(s.requiredBehavior()))
-                .filter(s -> s.relatedSteps().stream()
-                        .anyMatch(ra -> completedStepId.equals(ra.actionId())))
-                .map(PlanDefinitionParser.StepMetadata::id)
+        // Find this step's own declared predecessors - actions named in its own
+        // relatedSteps - restricted to those with requiredBehavior="must"
+        PlanDefinitionParser.StepMetadata completedMetadata = steps.stream()
+                .filter(s -> completedStepId.equals(s.id()))
+                .findFirst()
+                .orElse(null);
+
+        if (completedMetadata == null || completedMetadata.relatedSteps().isEmpty()) {
+            return;
+        }
+
+        List<String> mustPredecessorIds = completedMetadata.relatedSteps().stream()
+                .map(PlanDefinitionParser.RelatedStepInfo::actionId)
+                .filter(predecessorId -> steps.stream()
+                        .anyMatch(s -> predecessorId.equals(s.id()) && "must".equals(s.requiredBehavior())))
                 .toList();
 
         if (mustPredecessorIds.isEmpty()) {

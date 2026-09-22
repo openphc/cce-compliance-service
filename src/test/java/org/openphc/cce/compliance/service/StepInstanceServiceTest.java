@@ -869,15 +869,15 @@ class StepInstanceServiceTest {
             PlanDefinition mockPlanDef = mock(PlanDefinition.class);
             when(planDefinitionParser.parse(anyString())).thenReturn(mockPlanDef);
 
-            // vitals-recording has relatedAction pointing to chief-complaints
+            // chief-complaints has relatedAction pointing to its own predecessor, vitals-recording
             List<PlanDefinitionParser.StepMetadata> actions = List.of(
                     new PlanDefinitionParser.StepMetadata("vitals-recording", "Vitals",
-                            List.of(), List.of(
-                            new PlanDefinitionParser.RelatedStepInfo("chief-complaints", "after-end",
-                                    BigDecimal.ZERO, "d")),
-                            null, 1, "must", List.of(), null),
+                            List.of(), List.of(), null, 1, "must", List.of(), null),
                     new PlanDefinitionParser.StepMetadata("chief-complaints", "Chief Complaints",
-                            List.of(), List.of(), null, 1, "must", List.of(), null));
+                            List.of(), List.of(
+                            new PlanDefinitionParser.RelatedStepInfo("vitals-recording", "after-end",
+                                    BigDecimal.ZERO, "d")),
+                            null, 1, "must", List.of(), null));
             when(planDefinitionParser.extractSteps(mockPlanDef)).thenReturn(actions);
 
             Deviation deviation = Deviation.builder().id(UUID.randomUUID()).build();
@@ -930,12 +930,12 @@ class StepInstanceServiceTest {
 
             List<PlanDefinitionParser.StepMetadata> actions = List.of(
                     new PlanDefinitionParser.StepMetadata("vitals-recording", "Vitals",
-                            List.of(), List.of(
-                            new PlanDefinitionParser.RelatedStepInfo("chief-complaints", "after-end",
-                                    BigDecimal.ZERO, "d")),
-                            null, 1, "must", List.of(), null),
+                            List.of(), List.of(), null, 1, "must", List.of(), null),
                     new PlanDefinitionParser.StepMetadata("chief-complaints", "Chief Complaints",
-                            List.of(), List.of(), null, 1, "must", List.of(), null));
+                            List.of(), List.of(
+                            new PlanDefinitionParser.RelatedStepInfo("vitals-recording", "after-end",
+                                    BigDecimal.ZERO, "d")),
+                            null, 1, "must", List.of(), null));
             when(planDefinitionParser.extractSteps(mockPlanDef)).thenReturn(actions);
 
             service.completeStep(completedStep, UUID.randomUUID(), "test-source", null);
@@ -976,15 +976,15 @@ class StepInstanceServiceTest {
             PlanDefinition mockPlanDef = mock(PlanDefinition.class);
             when(planDefinitionParser.parse(anyString())).thenReturn(mockPlanDef);
 
-            // history-assessment (could) → lab-order
+            // lab-order's own predecessor, history-assessment, is optional (could) — not a violation
             List<PlanDefinitionParser.StepMetadata> actions = List.of(
                     new PlanDefinitionParser.StepMetadata("history-assessment", "History",
-                            List.of(), List.of(
-                            new PlanDefinitionParser.RelatedStepInfo("lab-order", "after-end",
-                                    BigDecimal.ZERO, "d")),
-                            null, 1, "could", List.of(), null),
+                            List.of(), List.of(), null, 1, "could", List.of(), null),
                     new PlanDefinitionParser.StepMetadata("lab-order", "Lab Order",
-                            List.of(), List.of(), null, 1, "must", List.of(), null));
+                            List.of(), List.of(
+                            new PlanDefinitionParser.RelatedStepInfo("history-assessment", "after-end",
+                                    BigDecimal.ZERO, "d")),
+                            null, 1, "must", List.of(), null));
             when(planDefinitionParser.extractSteps(mockPlanDef)).thenReturn(actions);
 
             service.completeStep(completedStep, UUID.randomUUID(), "test-source", null);
@@ -1016,15 +1016,17 @@ class StepInstanceServiceTest {
             PlanDefinition mockPlanDef = mock(PlanDefinition.class);
             when(planDefinitionParser.parse(anyString())).thenReturn(mockPlanDef);
 
-            // visit-encounter has relatedAction but no one points TO it
+            // visit-encounter has no relatedAction of its own (it's the root); vitals-recording
+            // declares visit-encounter as ITS predecessor, which must not affect visit-encounter's
+            // own check
             List<PlanDefinitionParser.StepMetadata> actions = List.of(
                     new PlanDefinitionParser.StepMetadata("visit-encounter", "Visit",
-                            List.of(), List.of(
-                            new PlanDefinitionParser.RelatedStepInfo("vitals-recording", "after-start",
-                                    BigDecimal.ZERO, "d")),
-                            null, 1, "must", List.of(), null),
+                            List.of(), List.of(), null, 1, "must", List.of(), null),
                     new PlanDefinitionParser.StepMetadata("vitals-recording", "Vitals",
-                            List.of(), List.of(), null, 1, "must", List.of(), null));
+                            List.of(), List.of(
+                            new PlanDefinitionParser.RelatedStepInfo("visit-encounter", "after-start",
+                                    BigDecimal.ZERO, "d")),
+                            null, 1, "must", List.of(), null));
             when(planDefinitionParser.extractSteps(mockPlanDef)).thenReturn(actions);
 
             service.completeStep(completedStep, UUID.randomUUID(), "test-source", null);
