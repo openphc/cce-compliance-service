@@ -3,19 +3,25 @@
 # ==============================================================================
 
 server:
-  port: ${SERVER_PORT:8080}
+  port: ${SERVER_PORT:8092}
 
 spring:
   application:
     name: cce-compliance-service
 
   # --- DataSource ---
+  # Shared ccedb. DB_PORT defaults to the standard 5432; set it to 5433 to reach the instance
+  # deployed by cce-collector-service.
   datasource:
-    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:cce_compliance}
-    username: ${DB_USERNAME:cce_compliance}
-    password: ${DB_PASSWORD:changeme}
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:ccedb}
+    username: ${DB_USERNAME:cce_user}
+    password: ${DB_PASSWORD:cce_pass}
     hikari:
       maximum-pool-size: ${DB_POOL_SIZE:20}
+      minimum-idle: ${DB_POOL_MIN_IDLE:5}
+      connection-timeout: ${DB_CONNECTION_TIMEOUT:30000}
+      idle-timeout: ${DB_IDLE_TIMEOUT:600000}
+      max-lifetime: ${DB_MAX_LIFETIME:1800000}
 
   # --- JPA / Hibernate ---
   jpa:
@@ -28,25 +34,18 @@ spring:
           time_zone: UTC
 
   # --- Flyway ---
+  # This service owns no tables. The Matcher Service's migration creates step_instance,
+  # step_sla_state_transition, deviation and intelligence_event_log; the Protocol Service's creates
+  # protocol_definition, action_definition and trigger_index. Enabling Flyway here would
+  # only add an empty ledger and invite a second service to start writing DDL for tables it does not own.
   flyway:
-    enabled: true
-    locations: classpath:db/migration
-    baseline-on-migrate: true
+    enabled: false
 
-  # --- Kafka Consumer ---
+  # --- Kafka ---
+  # Produce-only. This service consumes nothing, so there is no consumer or listener configuration
+  # here and KafkaConfig declares no listener container factory.
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
-    listener:
-      ack-mode: record
-      concurrency: 3
-    consumer:
-      group-id: cce-compliance-service
-      auto-offset-reset: earliest
-      enable-auto-commit: false
-      properties:
-        isolation.level: read_committed
-        max.poll.records: 100
-        max.poll.interval.ms: 300000
     producer:
       acks: all
       retries: 3
@@ -58,13 +57,26 @@ spring:
 cce:
   kafka:
     topics:
-      inbound-events: cce.events.inbound
-      scheduler-triggers: cce.scheduler.triggers
       intelligence-triggers: cce.intelligence.triggers
       default-partitions: 25
-    retry:
-      max-attempts: 3
-      backoff-interval-ms: 1000
+    # No cce.kafka.retry.* here: retry and DLQ settings govern a consumer, and this service has none.
+  protocol:
+    # Read by the shared ParsedProtocolCache, which intelligence evaluation uses to resolve a step's
+    # metadata from its protocol definition.
+    parsed-cache-size: ${CCE_PARSED_PROTOCOL_CACHE_SIZE:256}
+  intelligence:
+    # How long to wait for Kafka to acknowledge an intelligence trigger before recording it unpublished
+    publish-confirm-timeout-ms: ${CCE_PUBLISH_CONFIRM_TIMEOUT_MS:5000}
+  sla:
+    # The evaluator fetches step_sla_state_transition rows with FOR UPDATE SKIP LOCKED, so every replica
+    # can poll concurrently. This interval is the steady-state cost — one empty fetch query per tick; a
+    # backlog is drained within a single cycle rather than one batch per tick.
+    poll-interval-ms: ${CCE_SLA_POLL_INTERVAL_MS:5000}
+    batch-size: ${CCE_SLA_BATCH_SIZE:100}
+    # Recorded in processed_by, so each row says which replica applied it.
+    instance-id: ${CCE_SLA_INSTANCE_ID:${HOSTNAME:local}}
+    # Cap on the exponential retry backoff for a row that keeps failing.
+    max-backoff-seconds: ${CCE_SLA_MAX_BACKOFF_SECONDS:3600}
 
 # --- Actuator ---
 management:
@@ -77,9 +89,6 @@ management:
       show-details: when-authorized
       probes:
         enabled: true
-  tracing:
-    sampling:
-      probability: 1.0
   metrics:
     tags:
       application: cce-compliance-service
@@ -91,3 +100,4 @@ logging:
     org.apache.kafka: WARN
     org.hibernate: WARN
     org.openphc.cce.compliance: INFO
+

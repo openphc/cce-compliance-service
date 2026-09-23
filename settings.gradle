@@ -1,1 +1,6 @@
 rootProject.name = 'cce-compliance-service'
+
+// Shared vocabulary, Kafka contracts and FHIR logic. A composite build rather than a published
+// artifact: the repos sit side by side, so a change in common-util is picked up on the next build
+// with no publish step and no version bump.
+includeBuild '../cce-common-util'

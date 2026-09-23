@@ -1,0 +1,123 @@
+name: Java CI and GHCR Push
+
+on:
+  push:
+    branches: [ "release-1.0.0" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_URI: ghcr.io/${{ github.repository }}
+  # Incremental release tags: v1, v2, v3, ... (one new tag per successful build)
+  VERSION_TAG_PREFIX: v
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    # Two checkouts, laid out as siblings. On the 2.0.0 line settings.gradle
+    # declares includeBuild '../cce-common-util', so a single checkout fails at
+    # configuration time with "Included build ... does not exist".
+    - uses: actions/checkout@v5
+      with:
+        path: cce-compliance-service
+
+    # Build against the library's matching release line, not its default branch:
+    # the 2.0.0 API lives on release-2.0.0, and building this service against
+    # main would compile it against a different library than the branch uses.
+    # Falls back to main when the line does not exist there yet, which is also
+    # what happens on the 1.0.0 line, where nothing consumes the checkout.
+    - name: Resolve the cce-common-util branch to build against
+      id: lib
+      env:
+        LINE: ${{ github.ref_name }}
+      run: |
+        if git ls-remote --exit-code --heads \
+             https://github.com/openphc/cce-common-util.git "$LINE" >/dev/null 2>&1; then
+          echo "ref=$LINE" >> "$GITHUB_OUTPUT"
+        else
+          echo "ref=main" >> "$GITHUB_OUTPUT"
+          echo "::notice::cce-common-util has no '$LINE' branch — building against main"
+        fi
+
+    - uses: actions/checkout@v5
+      with:
+        repository: openphc/cce-common-util
+        ref: ${{ steps.lib.outputs.ref }}
+        path: cce-common-util
+
+    - name: Set up JDK 21
+      uses: actions/setup-java@v5
+      with:
+        java-version: '21'
+        distribution: 'temurin'
+
+    # Configure Gradle for optimal use in GitHub Actions, including caching of downloaded dependencies.
+    # See: https://github.com/gradle/actions/blob/main/setup-gradle/README.md
+    - name: Setup Gradle
+      uses: gradle/actions/setup-gradle@v4
+
+    - name: Determine next version tag
+      id: version
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        OWNER="${{ github.repository_owner }}"
+        PKG="${{ github.event.repository.name }}"
+        PREFIX="${VERSION_TAG_PREFIX}"
+        TAGS=$(gh api "/orgs/${OWNER}/packages/container/${PKG}/versions?per_page=100" \
+          --jq '.[].metadata.container.tags[]' 2>/dev/null | grep -E "^${PREFIX}[0-9]+$" || true)
+        if [ -z "$TAGS" ]; then
+          VERSION_TAG="${PREFIX}1"
+        else
+          MAX_NUM=$(echo "$TAGS" | sed "s/^${PREFIX}//" | sort -n | tail -1)
+          VERSION_TAG="${PREFIX}$((MAX_NUM + 1))"
+        fi
+        echo "version_tag=${VERSION_TAG}" >> "$GITHUB_OUTPUT"
+        echo "Version tag for this build: ${VERSION_TAG}"
+
+    - name: Build with Gradle
+      working-directory: cce-compliance-service
+      run: ./gradlew build
+
+    - name: Build container image
+      working-directory: cce-compliance-service
+      run: ./gradlew bootBuildImage --imageName=${IMAGE_URI}:${{ steps.version.outputs.version_tag }}
+
+    - name: Tag image as latest
+      run: docker tag ${IMAGE_URI}:${{ steps.version.outputs.version_tag }} ${IMAGE_URI}:latest
+
+    - name: Log in to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.repository_owner }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Push version and latest to GHCR
+      run: |
+        VERSION_TAG="${{ steps.version.outputs.version_tag }}"
+        docker push ${IMAGE_URI}:${VERSION_TAG}
+        docker push ${IMAGE_URI}:latest
+
+  trigger-deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/release-1.0.0' && success()
+    env:
+      GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+    steps:
+      - name: Trigger deploy-scripts workflow_dispatch
+        run: |
+          gh api --method POST \
+            /repos/openphc/deploy-scripts/actions/workflows/deploy.yml/dispatches \
+            --input - <<'JSON'
+          {
+            "ref": "main",
+            "inputs": { "target_env": "dev" }
+          }
+          JSON
