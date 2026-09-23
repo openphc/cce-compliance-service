@@ -284,7 +284,7 @@ Bean validation failures (e.g. a blank required field) do not return a structure
 
 ## 4. DTO Schemas
 
-> **Enum values:** All status, state, and type fields use enum values described in [Data Dictionary §12 — Enumerated Value Reference](data-dictionary.md#12-enumerated-value-reference).
+> **Enum values:** All status, state, and type fields use enum values described in [Data Dictionary §15 — Enumerated Value Reference](data-dictionary.md#15-enumerated-value-reference).
 
 ### ProtocolDefinitionDto
 

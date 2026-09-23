@@ -171,7 +171,8 @@ cce-compliance-service/
 │               ├── V4__state_history.sql
 │               ├── V5__deviation_unique_constraint.sql
 │               ├── V6__drop_uuid_defaults_for_v7.sql
-│               └── V7__facility_district.sql
+│               ├── V7__facility_district.sql
+│               └── V8__group_step_instance.sql
 ├── Dockerfile                          # Multi-stage Docker build
 ├── .gitignore
 ├── build.gradle                        # Gradle build configuration
@@ -207,6 +208,7 @@ psql -h localhost -p 5433 -U cce_user -d ccedb \
 | V5 | Deduplicate deviations and enforce one deviation per (step, type) | `V5__deviation_unique_constraint.sql` |
 | V6 | Drop DB-side UUID (v4) defaults now that ids are generated application-side as UUID v7 | `V6__drop_uuid_defaults_for_v7.sql` |
 | V7 | Add `district_name` column to facility | `V7__facility_district.sql` |
+| V8 | Repeating step groups: `group_step_instance` table + `step_instance.group_step_instance_id` FK | `V8__group_step_instance.sql` |
 
 ## 6. Docker Build
 
@@ -280,7 +282,7 @@ Stage 2: Runtime (eclipse-temurin:21-jre-alpine)
 ### 8.3 Running Tests
 
 ```bash
-# Unit tests (416 tests)
+# Unit tests (424 tests)
 ./gradlew test
 
 # Integration tests (33 tests — EmbeddedKafka + H2)
